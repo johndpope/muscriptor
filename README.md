@@ -16,16 +16,31 @@ MuScriptor is the first music transcription model that has been trained on a lar
 </p>
 -->
 
+## Try it locally
+
+You can try it locally with the web UI with:
+
+```bash
+uvx muscriptor serve
+```
+
+or with the CLI:
+
+```bash
+uvx muscriptor transcribe
+```  
+
+
 ## Installation
+
+with uv (recommended):
+
+```bash
+uv add muscriptor
+```
 
 ```bash
 pip install muscriptor
-```
-
-For development, clone the repo and install it editable:
-
-```bash
-pip install -e .
 ```
 
 ## Models
