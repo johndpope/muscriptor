@@ -15,8 +15,19 @@ from muscriptor.tokenizer.mt3 import (
     resolve_instrument_names,
 )
 from muscriptor.transcription_model import TranscriptionModel
+from muscriptor.utils.download import ModelDownloadError
 
 app = typer.Typer(add_completion=False, help="muscriptor — audio-to-MIDI transcription")
+
+
+def _load_model(model_path: str | None, device: str | None) -> TranscriptionModel:
+    """load_model with CLI-friendly failure: known download problems (missing
+    HuggingFace authentication, …) print a plain message instead of a traceback."""
+    try:
+        return TranscriptionModel.load_model(weights_path=model_path, device=device)
+    except ModelDownloadError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
 
 class OutputFormat(str, Enum):
@@ -189,10 +200,7 @@ def transcribe(
     # All chatty progress/timing info goes to stderr — stdout is reserved for
     # the actual output when `-o -` is used.
     typer.echo("Loading model…", err=True)
-    model = TranscriptionModel.load_model(
-        weights_path=model_path,
-        device=_device,
-    )
+    model = _load_model(model_path, _device)
     import torch
 
     model._model = model._model.to(torch.float32)
@@ -306,7 +314,7 @@ def serve(
 
     _device = None if device == "auto" else device
     typer.echo("Loading model…")
-    model = TranscriptionModel.load_model(weights_path=model_path, device=_device)
+    model = _load_model(model_path, _device)
     web_dir = Path(__file__).resolve().parent / "web_dist"
     fastapi_app = create_app(model, web_dir=web_dir if web_dir.is_dir() else None)
     uvicorn.run(fastapi_app, host=host, port=port)

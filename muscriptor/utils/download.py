@@ -5,11 +5,35 @@ import os
 import urllib.request
 from pathlib import Path
 from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import (
+    GatedRepoError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+)
 from huggingface_hub.utils import EntryNotFoundError
 
 
 _CACHE_DIR = Path.home() / ".cache" / "muscriptor"
+
+
+class ModelDownloadError(RuntimeError):
+    """Downloading the model weights failed for a reason the user must fix
+    (typically missing HuggingFace authentication). The message is meant to
+    be shown to the user as-is, without a traceback."""
+
+
+def _auth_help(repo_id: str) -> str:
+    return (
+        f"cannot download '{repo_id}' from HuggingFace: the MuScriptor model "
+        "weights are gated and require a (free) HuggingFace account.\n\n"
+        f"  1. Accept the model license at https://huggingface.co/{repo_id}\n"
+        "     (access is granted automatically).\n"
+        "  2. Authenticate on this machine, either:\n"
+        "       - run: uvx hf auth login\n"
+        "       - or set the HF_TOKEN environment variable to a read token\n"
+        "         from https://huggingface.co/settings/tokens\n\n"
+        "See the 'HuggingFace login' section of the README for details."
+    )
 
 
 def download_if_necessary(url: str | Path) -> Path:
@@ -28,7 +52,17 @@ def download_if_necessary(url: str | Path) -> Path:
     """
     if isinstance(url, str) and url.startswith("hf://"):
         org, name, hf_filename = url[len("hf://") :].split("/", 2)
-        cached = hf_hub_download(repo_id=f"{org}/{name}", filename=hf_filename)
+        repo_id = f"{org}/{name}"
+        try:
+            cached = hf_hub_download(repo_id=repo_id, filename=hf_filename)
+        except (GatedRepoError, RepositoryNotFoundError) as e:
+            # What an unauthenticated (or not-yet-approved) client gets back
+            # from a gated repo, depending on hub version and repo state.
+            raise ModelDownloadError(_auth_help(repo_id)) from e
+        except HfHubHTTPError as e:
+            if getattr(e.response, "status_code", None) in (401, 403):
+                raise ModelDownloadError(_auth_help(repo_id)) from e
+            raise
         return Path(cached)
 
     if isinstance(url, str) and url.startswith(("http://", "https://")):

@@ -16,6 +16,30 @@ MuScriptor is the first music transcription model that has been trained on a lar
 </p>
 -->
 
+## HuggingFace login (required)
+
+The model weights are hosted on [HuggingFace](https://huggingface.co/MuScriptor)
+and gated behind their CC BY-NC 4.0 license, so downloading them — including
+on the first `uvx muscriptor` run — requires a (free) HuggingFace account:
+
+1. Accept the model license on the model page, e.g.
+   [muscriptor-medium](https://huggingface.co/MuScriptor/muscriptor-medium)
+   (access is granted automatically).
+2. Authenticate on your machine:
+
+   ```bash
+   uvx hf auth login
+   ```
+
+   or set a token (create one at
+   [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)):
+
+   ```bash
+   export HF_TOKEN=hf_...
+   ```
+
+The weights are then downloaded on first use and cached locally.
+
 ## Try it locally
 
 You can try it locally with the web UI with:
@@ -29,6 +53,16 @@ or with the CLI:
 ```bash
 uvx muscriptor transcribe
 ```  
+
+> **Intel Macs:** PyTorch stopped shipping Intel-mac (x86_64) wheels after
+> torch 2.2.2, which supports Python ≤ 3.12, so you must tell uvx to use
+> Python 3.12:
+>
+> ```bash
+> uvx --python 3.12 muscriptor serve
+> ```
+>
+> If you install with pip/uv instead, use Python 3.10–3.12.
 
 
 ## Installation
