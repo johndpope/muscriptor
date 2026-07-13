@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::fs;
 
 pub fn download_weights(url: &str) -> Result<PathBuf, DownloadError> {

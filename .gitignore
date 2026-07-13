@@ -13,3 +13,6 @@ web/tsconfig.tsbuildinfo
 *.egg-info
 __pycache__
 .DS_Store
+
+# Rust build artifacts
+muscriptor-rs/target/

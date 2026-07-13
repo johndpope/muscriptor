@@ -36,7 +36,7 @@ struct Cli {
     weights: Option<PathBuf>,
 
     /// Instrument names to condition on (comma-separated)
-    #[arg(short, long)]
+    #[arg(short = 'I', long)]
     instruments: Option<String>,
 
     /// Use sampling instead of greedy decoding
