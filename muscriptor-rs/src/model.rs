@@ -400,9 +400,28 @@ impl LMModel {
         self.lin.forward(&h)
     }
 
+    /// Pick the next token from last-position logits (greedy or sampling).
+    fn pick(&self, logits: &Tensor, sample: bool, temp: f64, dev: &Device) -> Result<i64> {
+        if sample && temp > 0.0 {
+            let temp_t = Tensor::new(temp as f32, dev)?;
+            let probs = candle_nn::ops::softmax(&(logits / temp_t)?, 1)?;
+            sample_token(&probs, dev)?.to_scalar::<i64>()
+        } else {
+            logits.argmax(1)?.squeeze(0)?.to_dtype(DType::I64)?.to_scalar::<i64>()
+        }
+    }
+
+    /// Autoregressively generate tokens for one chunk.
+    ///
+    /// `prompt` (may be empty) is a forced prefix — the teacher-forced tie
+    /// prologue for prelude forcing. Its tokens are prefilled verbatim right
+    /// after the initial token and included at the front of the returned
+    /// sequence (so the downstream decoder sees them), then free generation
+    /// continues until EOS or `max_len` total tokens.
     pub fn generate(
         &self, mel: &Tensor, inst: &Tensor, ds: &Tensor,
         max_len: usize, sample: bool, temp: f64, _top_k: usize, _top_p: f64,
+        prompt: &[i64],
     ) -> Result<Vec<i64>> {
         let dev = mel.device();
         let eos = 1i64;
@@ -411,41 +430,36 @@ impl LMModel {
         let mut kcs: Vec<Option<Tensor>> = vec![None; nl];
         let mut vcs: Vec<Option<Tensor>> = vec![None; nl];
         let mut los: Vec<usize> = vec![0; nl];
-        let mut out = Vec::new();
+        let mut out: Vec<i64> = Vec::new();
 
-        for step in 0..max_len {
-            let first = step == 0;
-            let seq_data: Vec<i64> = if first {
-                let mut v = vec![init];
-                v.extend_from_slice(&out);
-                v
-            } else if out.is_empty() {
-                vec![init]
-            } else {
-                let last = out[step - 1];
-                if last == eos { break; }
-                vec![last]
-            };
-            let sl = seq_data.len();
-            let seq = Tensor::from_vec(seq_data, (1, sl), dev)?;
+        // Prefill: [init] + forced prompt. forward(first=true) prepends the
+        // conditioning; the last position predicts the first free token.
+        let mut prefill = Vec::with_capacity(1 + prompt.len());
+        prefill.push(init);
+        prefill.extend_from_slice(prompt);
+        let sl = prefill.len();
+        let seq = Tensor::from_vec(prefill, (1, sl), dev)?;
+        let logits = self.forward(&seq, mel, inst, ds, true, &mut kcs, &mut vcs, &mut los)?;
+        let logits = logits.narrow(1, sl - 1, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
 
-            let logits = self.forward(&seq, mel, inst, ds, first, &mut kcs, &mut vcs, &mut los)?;
-            let logits = logits.narrow(1, sl - 1, 1)?.squeeze(1)?;
-            let logits = logits.to_dtype(DType::F32)?;
-
-            // (No OOV mask needed: the linear layer outputs card logits,
-            //  so indices >= card already have no logit.)
-            let logits = logits;
-
-            let next = if sample && temp > 0.0 {
-                let temp_t = Tensor::new(temp as f32, dev)?;
-                let probs = candle_nn::ops::softmax(&(&logits / temp_t)?, 1)?;
-                sample_token(&probs, dev)?.to_scalar::<i64>()?
-            } else {
-                logits.argmax(1)?.squeeze(0)?.to_dtype(DType::I64)?.to_scalar::<i64>()?
-            };
+        // The forced prompt tokens are part of the emitted sequence.
+        out.extend_from_slice(prompt);
+        if out.len() < max_len {
+            let next = self.pick(&logits, sample, temp, dev)?;
             out.push(next);
         }
+
+        // Incremental free generation.
+        while out.len() < max_len {
+            let last = *out.last().unwrap();
+            if last == eos { break; }
+            let seq = Tensor::from_vec(vec![last], (1, 1), dev)?;
+            let logits = self.forward(&seq, mel, inst, ds, false, &mut kcs, &mut vcs, &mut los)?;
+            let logits = logits.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
+            let next = self.pick(&logits, sample, temp, dev)?;
+            out.push(next);
+        }
+
         if log::log_enabled!(log::Level::Debug) {
             let n = out.len().min(60);
             log::debug!("first {} tokens: {:?}", n, &out[..n]);

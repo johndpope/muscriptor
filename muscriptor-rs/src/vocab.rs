@@ -34,6 +34,169 @@ pub fn build_event_vocab(max_shift_steps: usize) -> Vec<Event> {
 
 pub fn eos_id() -> usize { 1 }
 
+/// First vocab index whose event matches `(etype, value)`, if any.
+fn token_id(vocab: &[Event], etype: &str, value: i32) -> Option<i64> {
+    vocab.iter().position(|e| e.etype == etype && e.value == value).map(|i| i as i64)
+}
+
+/// Encode a tie prologue declaring `open_keys` (sorted `(program, pitch)`
+/// pairs) as sustained: each program token emitted once for its run of
+/// pitches, terminated by the `tie` token. Matches the training encoder's
+/// tie-section layout so it can be teacher-forced at the start of a chunk.
+pub fn tie_section_token_ids(open_keys: &[(u8, u8)], vocab: &[Event]) -> Vec<i64> {
+    let mut tokens = Vec::new();
+    let mut program_state: Option<u8> = None;
+    for &(program, pitch) in open_keys {
+        if Some(program) != program_state {
+            if let Some(id) = token_id(vocab, "program", program as i32) {
+                tokens.push(id);
+            }
+            program_state = Some(program);
+        }
+        if let Some(id) = token_id(vocab, "pitch", pitch as i32) {
+            tokens.push(id);
+        }
+    }
+    if let Some(id) = token_id(vocab, "tie", 0) {
+        tokens.push(id);
+    }
+    tokens
+}
+
+/// Mirror of [`decode_tokens`]'s open-note bookkeeping. Fed the same
+/// ChunkBoundary settling and token stream, [`OpenNoteTracker::open_keys`]
+/// returns the `(program, pitch)` pairs still sounding — exactly the notes the
+/// next chunk's tie prologue must declare (see [`tie_section_token_ids`]).
+/// Every rule here matches a branch of `decode_tokens` so the two must not
+/// drift.
+pub struct OpenNoteTracker<'a> {
+    vocab: &'a [Event],
+    frame_rate: usize,
+    open: std::collections::BTreeSet<(u8, u8)>,
+    next_seek_time: Option<f64>,
+    start_tick: i32,
+    tick_state: i32,
+    program: Option<u8>,
+    velocity: Option<u8>,
+    in_prologue: bool,
+    skip_rest: bool,
+    tie_set: HashSet<(u8, u8)>,
+    chunk_started: bool,
+}
+
+impl<'a> OpenNoteTracker<'a> {
+    pub fn new(vocab: &'a [Event], frame_rate: usize) -> Self {
+        Self {
+            vocab,
+            frame_rate,
+            open: std::collections::BTreeSet::new(),
+            next_seek_time: None,
+            start_tick: 0,
+            tick_state: 0,
+            program: None,
+            velocity: None,
+            in_prologue: true,
+            skip_rest: false,
+            tie_set: HashSet::new(),
+            chunk_started: false,
+        }
+    }
+
+    /// Start a new chunk. Open notes persist across the boundary, except a
+    /// chunk that never closed its tie prologue leaves an empty tie set, so
+    /// every open note ends at its boundary.
+    pub fn feed_boundary(&mut self, seek_time: f64, next_seek_time: Option<f64>) {
+        if self.chunk_started && self.in_prologue {
+            self.open.clear();
+        }
+        self.next_seek_time = next_seek_time;
+        self.start_tick = (seek_time * self.frame_rate as f64).round() as i32;
+        self.tick_state = self.start_tick;
+        self.program = None;
+        self.velocity = None;
+        self.in_prologue = true;
+        self.skip_rest = false;
+        self.tie_set.clear();
+        self.chunk_started = true;
+    }
+
+    pub fn feed_token(&mut self, token_id: i64) {
+        if token_id < 0 || token_id as usize >= self.vocab.len() {
+            return;
+        }
+        let event = &self.vocab[token_id as usize];
+        let etype = event.etype.as_str();
+        match etype {
+            "PAD" | "EOS" | "UNK" => return,
+            _ => {}
+        }
+
+        if self.in_prologue {
+            match etype {
+                "tie" => {
+                    self.in_prologue = false;
+                    self.velocity = None;
+                    // open &= tie_set
+                    self.open.retain(|k| self.tie_set.contains(k));
+                }
+                "shift" => {
+                    // Malformed chunk: decoder closes everything and drops the rest.
+                    self.in_prologue = false;
+                    self.skip_rest = true;
+                    self.open.clear();
+                }
+                "program" => self.program = Some(event.value as u8),
+                "pitch" => {
+                    if let Some(prog) = self.program {
+                        self.tie_set.insert((prog, event.value as u8));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.skip_rest {
+            return;
+        }
+
+        match etype {
+            "shift" => {
+                if event.value > 0 {
+                    self.tick_state = self.start_tick + event.value;
+                }
+            }
+            "program" => self.program = Some(event.value as u8),
+            "velocity" => self.velocity = Some(event.value as u8),
+            // Drums are instantaneous and never held open, so only pitch
+            // events move the open set.
+            "pitch" => {
+                let (prog, vel) = match (self.program, self.velocity) {
+                    (Some(p), Some(v)) => (p, v),
+                    _ => return,
+                };
+                let time = self.tick_state as f64 / self.frame_rate as f64;
+                if let Some(nst) = self.next_seek_time {
+                    if time >= nst {
+                        return;
+                    }
+                }
+                let key = (prog, event.value as u8);
+                self.open.remove(&key);
+                if vel > 0 {
+                    self.open.insert(key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Sorted `(program, pitch)` pairs currently held open.
+    pub fn open_keys(&self) -> Vec<(u8, u8)> {
+        self.open.iter().copied().collect()
+    }
+}
+
 /// Map instrument group name to a space-separated list of group IDs.
 pub fn instrument_group_from_names(names: &[String]) -> Option<String> {
     if names.is_empty() {

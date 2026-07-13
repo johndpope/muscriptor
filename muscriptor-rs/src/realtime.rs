@@ -88,6 +88,7 @@ impl RealtimeTranscriber {
             &mel_t, &inst_t, &ds_t,
             self.max_gen_len, self.sampling, self.temperature,
             self.top_k, self.top_p,
+            &[],
         )?;
 
         let events = decode_tokens(&tokens, &self.vocab, chunk_start_time, None);

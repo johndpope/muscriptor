@@ -15,7 +15,8 @@ use clap::Parser;
 use candle_core::{Device, Tensor};
 
 use config::{ModelConfig, DEFAULT_CONFIGS};
-use vocab::{build_event_vocab, decode_tokens, events_to_notes, instrument_group_from_names};
+use vocab::{build_event_vocab, decode_tokens, events_to_notes, instrument_group_from_names,
+    tie_section_token_ids, OpenNoteTracker, FRAME_RATE};
 
 /// MuScriptor-rs: Audio-to-MIDI transcription in Rust
 #[derive(Parser)]
@@ -68,6 +69,12 @@ struct Cli {
     /// Maximum generation length per chunk
     #[arg(long, default_value = "2000")]
     max_gen_len: usize,
+
+    /// Disable prelude forcing (teacher-forcing each chunk's tie prologue from
+    /// the previous chunk's still-open notes, so chunks can't restart sustained
+    /// notes with the wrong instrument). On by default.
+    #[arg(long = "no-prelude-forcing", action = clap::ArgAction::SetTrue)]
+    no_prelude_forcing: bool,
 }
 
 fn load_device(cpu: bool) -> Device {
@@ -195,12 +202,36 @@ fn run_file(
     )?;
     let ds_t = model.dc.tokenize(&[None], &model.device)?;
 
+    // Prelude forcing: teacher-force each chunk's tie prologue from the notes
+    // the previous chunk left open, so a chunk can't restart sustained notes
+    // with the wrong instrument. Chunks are generated strictly in order here,
+    // so it is always applicable.
+    let prelude_forcing = !cli.no_prelude_forcing;
+    if prelude_forcing {
+        log::info!("Prelude forcing enabled");
+    }
+    let mut tracker = OpenNoteTracker::new(&vocab, FRAME_RATE);
+
     for chunk_idx in 0..num_chunks {
         log::info!("Chunk {}/{}", chunk_idx + 1, num_chunks);
         let start = chunk_idx * segment_samples;
         let end = (start + segment_samples).min(audio.len());
         let mut chunk_audio: Vec<f32> = audio[start..end].to_vec();
         chunk_audio.resize(segment_samples, 0.0f32);
+
+        let seek_time = chunk_idx as f64 * segment_dur;
+        let next_seek_time = if chunk_idx + 1 < num_chunks {
+            Some((chunk_idx + 1) as f64 * segment_dur)
+        } else {
+            None
+        };
+        // Settle the tracker on the boundary before reading its open notes.
+        tracker.feed_boundary(seek_time, next_seek_time);
+        let prompt: Vec<i64> = if prelude_forcing && chunk_idx > 0 {
+            tie_section_token_ids(&tracker.open_keys(), &vocab)
+        } else {
+            Vec::new()
+        };
 
         let t0 = Instant::now();
         let chunk_mel_raw = mel_spec.compute(&chunk_audio);
@@ -215,8 +246,15 @@ fn run_file(
             &mel_t, &inst_t, &ds_t,
             cli.max_gen_len, cli.sampling, cli.temperature,
             cli.top_k, cli.top_p,
+            &prompt,
         )?;
         log::info!("  -> {} tokens ({:.2}s)", tokens.len(), t0.elapsed().as_secs_f64());
+
+        // Feed the chunk's tokens (forced prologue included) so the tracker's
+        // open-note set is ready for the next chunk's prologue.
+        for &t in &tokens {
+            tracker.feed_token(t);
+        }
         all_tokens.push((chunk_idx, tokens));
     }
 
