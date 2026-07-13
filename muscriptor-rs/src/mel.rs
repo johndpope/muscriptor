@@ -18,9 +18,11 @@ impl MelSpectrogram {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(n_fft);
 
+        // torch.hann_window(n_fft) is *periodic* (denominator n_fft), not the
+        // symmetric window (denominator n_fft-1).
         let window: Vec<f64> = (0..n_fft)
             .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n_fft - 1) as f64).cos())
+                0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / n_fft as f64).cos())
             })
             .collect();
 
@@ -39,26 +41,32 @@ impl MelSpectrogram {
 
     /// Compute mel spectrogram for mono audio at the model's sample rate.
     /// Returns [n_mels, n_frames] as f32.
+    ///
+    /// Matches `torch.stft(center=True, pad_mode="reflect")`: the signal is
+    /// reflect-padded by n_fft/2 on each side, so frame `m` is centred at
+    /// `m * hop` in the original signal and the frame count is `n/hop + 1`.
     pub fn compute(&self, audio: &[f32]) -> Vec<Vec<f32>> {
-        let n_frames = if audio.len() > self.n_fft {
-            ((audio.len() - self.n_fft) / self.hop_length) + 1
-        } else {
-            1
-        };
+        let n = audio.len();
+        let pad = self.n_fft / 2;
+        // Reflect-pad the signal (no edge repetition, matching torch 'reflect').
+        let padded_len = n + 2 * pad;
+        let mut sig = vec![0.0f64; padded_len];
+        for (i, s) in sig.iter_mut().enumerate() {
+            let idx = i as isize - pad as isize;
+            *s = audio[reflect_index(idx, n)] as f64;
+        }
 
+        let n_frames = if n == 0 { 1 } else { n / self.hop_length + 1 };
         let mut mel_spec = vec![vec![0.0f32; n_frames]; self.n_mels];
 
         for frame in 0..n_frames {
             let start = frame * self.hop_length;
 
-            // Apply Hann window and compute FFT
+            // Apply Hann window and compute FFT over the padded signal.
             let mut fft_in: Vec<Complex<f64>> = (0..self.n_fft)
                 .map(|i| {
-                    if start + i < audio.len() {
-                        Complex::new(audio[start + i] as f64 * self.window[i], 0.0)
-                    } else {
-                        Complex::new(0.0, 0.0)
-                    }
+                    let s = sig.get(start + i).copied().unwrap_or(0.0);
+                    Complex::new(s * self.window[i], 0.0)
                 })
                 .collect();
 
@@ -94,6 +102,20 @@ impl MelSpectrogram {
         }
         out
     }
+}
+
+/// Reflect an index into [0, n) with torch 'reflect' semantics (the boundary
+/// samples are not repeated), i.e. a triangle wave of period 2*(n-1).
+fn reflect_index(idx: isize, n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let period = 2 * (n as isize - 1);
+    let mut r = idx.rem_euclid(period);
+    if r >= n as isize {
+        r = period - r;
+    }
+    r as usize
 }
 
 fn hz_to_mel_htk(freq: f64) -> f64 {

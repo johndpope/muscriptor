@@ -84,10 +84,12 @@ impl Attn {
         let k = p.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
         let v = p.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
 
-        let (k, v) = if let (Some(kk), Some(vv)) = (kc.as_mut(), vc.as_mut()) {
-            let s = *off;
-            let kf = Tensor::cat(&[&kk.narrow(2, 0, s)?, &k], 2)?;
-            let vf = Tensor::cat(&[&vv.narrow(2, 0, s)?, &v], 2)?;
+        let (k, v) = if let (Some(kk), Some(vv)) = (kc.as_ref(), vc.as_ref()) {
+            // The cache holds exactly *off timesteps, so append the new
+            // key/value directly instead of narrowing (which copied the whole
+            // cache an extra time every step).
+            let kf = Tensor::cat(&[kk, &k], 2)?;
+            let vf = Tensor::cat(&[vv, &v], 2)?;
             *kc = Some(kf.clone());
             *vc = Some(vf.clone());
             (kf, vf)
@@ -100,21 +102,25 @@ impl Attn {
 
         let tq = q.dim(2)?;
         let tk = k.dim(2)?;
-        let scale = Tensor::new((dh as f64).powf(-0.5) as f32, dev)?;
-        let mut a = q.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&scale)?;
+        let scale = (dh as f64).powf(-0.5);
+        let mut a = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
 
-        // Causal mask (bottom-right triangular)
-        let mut mask_data: Vec<u8> = Vec::with_capacity(tq * tk);
-        for i in 0..tq {
-            for j in 0..tk {
-                mask_data.push(if j <= i + tk - tq { 1 } else { 0 });
+        // The causal mask only matters when queries and keys span the same
+        // window (the prefill). During incremental decoding tq == 1, so every
+        // cached key is visible and the mask is all-ones — skip building it.
+        if tq == tk && tq > 1 {
+            // Additive causal bias: 0.0 for visible positions, -inf for masked.
+            // (The previous `(1-mask) * -inf` form produced 0*-inf = NaN at every
+            // *visible* position, poisoning the whole forward pass with NaN.)
+            let mut bias: Vec<f32> = Vec::with_capacity(tq * tk);
+            for i in 0..tq {
+                for j in 0..tk {
+                    bias.push(if j <= i + tk - tq { 0.0 } else { f32::NEG_INFINITY });
+                }
             }
+            let bias = Tensor::from_vec(bias, (tq, tk), dev)?.to_dtype(dt)?;
+            a = a.broadcast_add(&bias)?;
         }
-        let mask = Tensor::from_vec(mask_data, (tq, tk), dev)?.to_dtype(dt)?;
-        let one = Tensor::new(1.0f32, dev)?.to_dtype(dt)?;
-        let ni = Tensor::new(f32::NEG_INFINITY, dev)?;
-        let am = (one.broadcast_sub(&mask))?.broadcast_mul(&ni)?;
-        a = (a.broadcast_mul(&mask)?.broadcast_add(&am))?;
 
         let a = candle_nn::ops::softmax(&a, 3)?;
         let o = a.matmul(&v)?;
@@ -383,7 +389,12 @@ impl LMModel {
             h = Tensor::cat(&[&ic, &dc, &mc, &h], 1)?;
             pl = h.dim(1)? - s;
         }
-        let offs = &[0usize];
+        // Absolute position of the tokens being processed = number of
+        // timesteps already in the KV cache (0 during the prefill). Using a
+        // hardcoded 0 here gave every incrementally-decoded token the
+        // position-0 sinusoidal embedding, corrupting generation.
+        let cur = los.first().copied().unwrap_or(0);
+        let offs = &[cur];
         h = self.tf.forward(&h, offs, kcs, vcs, los)?;
         h = if pl > 0 { self.on.forward(&h.narrow(1, pl, s)?)? } else { self.on.forward(&h)? };
         self.lin.forward(&h)
@@ -434,6 +445,10 @@ impl LMModel {
                 logits.argmax(1)?.squeeze(0)?.to_dtype(DType::I64)?.to_scalar::<i64>()?
             };
             out.push(next);
+        }
+        if log::log_enabled!(log::Level::Debug) {
+            let n = out.len().min(60);
+            log::debug!("first {} tokens: {:?}", n, &out[..n]);
         }
         Ok(out)
     }
