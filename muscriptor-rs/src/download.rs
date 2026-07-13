@@ -32,28 +32,33 @@ pub fn download_weights(url: &str) -> Result<PathBuf, DownloadError> {
     log::info!("Downloading {} from {} ...", filename, api_url);
 
     let token = std::env::var("HF_TOKEN").ok();
-    let resp = if let Some(t) = &token {
-        ureq::get(&api_url)
-            .set("Authorization", &format!("Bearer {}", t))
-            .call()
-            .map_err(|e| DownloadError::Http(e.to_string()))?
-    } else {
-        ureq::get(&api_url)
-            .call()
-            .map_err(|e| DownloadError::Http(e.to_string()))?
+    let make_req = || {
+        let req = ureq::get(&api_url);
+        if let Some(t) = &token {
+            req.set("Authorization", &format!("Bearer {}", t))
+        } else {
+            req
+        }
+    };
+    let resp = match make_req().call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => {
+            if code == 403 {
+                return Err(DownloadError::Auth(format!(
+                    "Cannot download '{}': the MuScriptor model weights are gated. \
+                     Visit https://huggingface.co/{} and accept the terms, \
+                     then set HF_TOKEN or run `huggingface-cli login`.",
+                    repo_id, repo_id
+                )));
+            }
+            return Err(DownloadError::Http(format!("status code {}", code)));
+        }
+        Err(e) => return Err(DownloadError::Http(e.to_string())),
     };
 
     let mut reader = resp.into_reader();
     let mut body: Vec<u8> = Vec::new();
     reader.read_to_end(&mut body).map_err(|e| DownloadError::Http(e.to_string()))?;
-
-    if body.len() < 100 && body.starts_with(b"<") {
-        return Err(DownloadError::Auth(format!(
-            "Cannot download '{}': the MuScriptor model weights are gated. \
-             Set HF_TOKEN or run `huggingface-cli login`.",
-            repo_id
-        )));
-    }
 
     fs::write(&cached_path, &body).map_err(DownloadError::Io)?;
     log::info!("Downloaded {} bytes to {}", body.len(), cached_path.display());
@@ -68,6 +73,8 @@ pub fn download_weights(url: &str) -> Result<PathBuf, DownloadError> {
             if rdr.read_to_string(&mut cfg_body).is_ok() && !cfg_body.starts_with('<') {
                 let _ = fs::write(&config_path, &cfg_body);
             }
+        } else {
+            // config download failure is non-fatal
         }
     }
 

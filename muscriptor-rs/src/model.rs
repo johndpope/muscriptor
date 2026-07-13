@@ -75,7 +75,7 @@ impl Attn {
     ) -> Result<Tensor> {
         let dev = x.device();
         let dt = x.dtype();
-        let (_, t, d) = x.dims3()?;
+        let (b, t, d) = x.dims3()?;
         let nh = self.nh;
         let dh = self.dh;
 
