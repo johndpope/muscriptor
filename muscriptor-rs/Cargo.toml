@@ -5,8 +5,8 @@ edition = "2021"
 description = "Audio-to-MIDI transcription using a transformer language model (Rust port)"
 
 [dependencies]
-candle-core = { version = "0.10", features = ["metal"] }
-candle-nn = { version = "0.10", features = ["metal"] }
+candle-core = { version = "0.10" }
+candle-nn = { version = "0.10" }
 hound = "3.5"
 ureq = { version = "2.10", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,10 +19,19 @@ clap = { version = "4", features = ["derive"] }
 fastrand = "2"
 dirs = "6"
 
-# Realtime mic capture
-cpal = "0.15"
-crossbeam-channel = "0.5"
+# Realtime mic capture (optional — requires ALSA dev headers on Linux)
+cpal = { version = "0.15", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
 
 [features]
 default = []
-realtime = []
+# GPU backends (mutually exclusive). Pick one at build time, e.g.
+#   cargo build --release --features cuda      # NVIDIA (Linux/Windows)
+#   cargo build --release --features metal     # Apple Silicon
+# The `metal` crate is macOS-only, so `metal` must NOT be enabled on Linux.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+# Live microphone capture. On Linux install the ALSA headers first, e.g.
+#   sudo apt-get install libasound2-dev
+realtime = ["dep:cpal", "dep:crossbeam-channel"]

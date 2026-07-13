@@ -4,6 +4,7 @@ pub mod download;
 pub mod mel;
 pub mod midi;
 pub mod model;
+#[cfg(feature = "realtime")]
 pub mod realtime;
 pub mod vocab;
 

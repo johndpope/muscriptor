@@ -5,6 +5,7 @@ mod model;
 mod vocab;
 mod midi;
 mod download;
+#[cfg(feature = "realtime")]
 mod realtime;
 
 use std::path::PathBuf;
@@ -71,12 +72,20 @@ struct Cli {
 
 fn load_device(cpu: bool) -> Device {
     if cpu {
-        Device::Cpu
-    } else {
-        Device::metal_if_available(0).unwrap_or_else(|_| {
-            Device::cuda_if_available(0).unwrap_or(Device::Cpu)
-        })
+        log::info!("Using CPU device");
+        return Device::Cpu;
     }
+    // Try CUDA first, then Metal. Only the backend compiled in via cargo
+    // features can succeed; the others report as unavailable and fall through.
+    let dev = Device::cuda_if_available(0)
+        .or_else(|_| Device::metal_if_available(0))
+        .unwrap_or(Device::Cpu);
+    match &dev {
+        Device::Cuda(_) => log::info!("Using CUDA device 0"),
+        Device::Metal(_) => log::info!("Using Metal device 0"),
+        Device::Cpu => log::warn!("No GPU backend available; falling back to CPU"),
+    }
+    dev
 }
 
 fn resolve_config(model_size: &str, weights: &Option<PathBuf>) -> Result<ModelConfig, Box<dyn std::error::Error>> {
@@ -136,7 +145,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if cli.mic {
-        run_realtime(model, &cli, inst_names)?;
+        #[cfg(feature = "realtime")]
+        {
+            run_realtime(model, &cli, inst_names)?;
+        }
+        #[cfg(not(feature = "realtime"))]
+        {
+            let _ = (model, inst_names);
+            return Err("--mic requires building with the `realtime` feature \
+                        (cargo build --release --features realtime,cuda)".into());
+        }
     } else {
         run_file(model, &cli, inst_names)?;
     }
@@ -229,6 +247,7 @@ fn run_file(
     Ok(())
 }
 
+#[cfg(feature = "realtime")]
 fn run_realtime(
     model: model::LMModel,
     cli: &Cli,
