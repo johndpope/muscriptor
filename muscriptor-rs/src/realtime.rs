@@ -80,11 +80,12 @@ pub fn run_realtime(
     inst_ids: Option<Vec<u32>>,
     opts: GenerateOptions,
     json: bool,
+    mic_device: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut transcriber = RealtimeTranscriber::new(model, inst_ids, opts);
 
     log::info!("Starting realtime mic capture...");
-    let (_stream, rx) = start_mic_capture()?;
+    let (_stream, rx) = start_mic_capture(mic_device)?;
     // Status/banner goes to stderr so stdout stays a clean machine-readable
     // stream (TSV, or JSONL for a UI).
     eprintln!("🎤 Listening... play music!");
@@ -119,16 +120,44 @@ pub fn run_realtime(
     Ok(())
 }
 
+/// Print the available input devices (for `--list-devices`).
+pub fn list_devices() -> Result<(), Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+    let default = host.default_input_device().and_then(|d| d.name().ok());
+    println!("Available input devices:");
+    for dev in host.input_devices()? {
+        let name = dev.name().unwrap_or_else(|_| "<unknown>".into());
+        let sr = dev.default_input_config().map(|c| format!("{} Hz", c.sample_rate().0)).unwrap_or_default();
+        let mark = if Some(&name) == default.as_ref() { " (default)" } else { "" };
+        println!("  {name}{mark}  {sr}");
+    }
+    Ok(())
+}
+
 /// Start microphone capture. Returns a receiver yielding (audio_chunk, start_time).
+/// `device_match` selects an input device by case-insensitive name substring
+/// (None = the system default).
 pub fn start_mic_capture(
+    device_match: Option<&str>,
 ) -> Result<
     (cpal::Stream, crossbeam_channel::Receiver<(Vec<f32>, f64)>),
     Box<dyn std::error::Error>,
 > {
     let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
-        .ok_or("No input device available")?;
+    // Pick the input device: a case-insensitive substring match on the name if
+    // `device_match` is given (e.g. "webcam"), else the system default.
+    let input_device = match device_match {
+        Some(want) => {
+            let want = want.to_lowercase();
+            host.input_devices()?
+                .find(|d| d.name().map(|n| n.to_lowercase().contains(&want)).unwrap_or(false))
+                .ok_or_else(|| format!("no input device matching '{want}' (try --list-devices)"))?
+        }
+        None => host.default_input_device().ok_or("No input device available")?,
+    };
+    if let Ok(name) = input_device.name() {
+        log::info!("Input device: {name}");
+    }
     let config = input_device.default_input_config()?;
     let channels = config.channels() as usize;
     let device_sr = config.sample_rate().0;

@@ -94,6 +94,15 @@ struct Cli {
     /// UI to consume.
     #[arg(long)]
     json: bool,
+
+    /// With --mic, select the input device by case-insensitive name substring
+    /// (e.g. "webcam"). Default: the system default input.
+    #[arg(long)]
+    mic_device: Option<String>,
+
+    /// List available audio input devices and exit.
+    #[arg(long)]
+    list_devices: bool,
 }
 
 fn load_device(cpu: bool) -> Device {
@@ -342,6 +351,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let cli = Cli::parse();
 
+    if cli.list_devices {
+        #[cfg(feature = "realtime")]
+        {
+            return realtime::list_devices();
+        }
+        #[cfg(not(feature = "realtime"))]
+        {
+            return Err("--list-devices requires building with the `realtime` feature".into());
+        }
+    }
+
     let device = load_device(cli.cpu);
     let model = load_model(&cli, &device)?;
 
@@ -350,7 +370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let inst_ids = instrument_ids(&cli)?;
             let opts = build_options(&cli);
-            realtime::run_realtime(model, inst_ids, opts, cli.json)?;
+            realtime::run_realtime(model, inst_ids, opts, cli.json, cli.mic_device.as_deref())?;
         }
         #[cfg(not(feature = "realtime"))]
         {
