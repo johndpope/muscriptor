@@ -96,9 +96,13 @@ fn load_device(cpu: bool) -> Device {
         log::info!("Using CPU device");
         return Device::Cpu;
     }
-    let dev = Device::cuda_if_available(0)
-        .or_else(|_| Device::metal_if_available(0))
-        .unwrap_or(Device::Cpu);
+    // `cuda_if_available`/`metal_if_available` return Ok(Cpu) (not Err) when the
+    // matching backend isn't compiled in, so chaining with `or_else` never falls
+    // through. Try CUDA, then Metal only if CUDA gave CPU.
+    let mut dev = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    if dev.is_cpu() {
+        dev = Device::metal_if_available(0).unwrap_or(Device::Cpu);
+    }
     match &dev {
         Device::Cuda(_) => log::info!("Using CUDA device 0"),
         Device::Metal(_) => log::info!("Using Metal device 0"),
