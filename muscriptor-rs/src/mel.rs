@@ -7,34 +7,40 @@ pub struct MelSpectrogram {
     n_fft: usize,
     hop_length: usize,
     n_mels: usize,
-    sample_rate: u32,
     window: Vec<f64>,
     fb: Vec<Vec<f64>>,   // mel filterbank [n_freqs, n_mels]
     fft: Arc<dyn Fft<f64>>,
 }
 
 impl MelSpectrogram {
-    pub fn new(sample_rate: u32, n_fft: usize, hop_length: usize, n_mels: usize) -> Self {
+    /// Build from the checkpoint's own buffers: `window` (length `n_fft`) and
+    /// `fb` (row-major `[n_fft/2+1, n_mels]`). MuScriptor checkpoints ship both
+    /// (`mel_spec_transform.spectrogram.window` / `mel_scale.fb`), so loading
+    /// them makes the front-end match the reference bit-for-bit — recomputing
+    /// the Hann window / HTK filterbank never matches torch exactly.
+    pub fn new(n_fft: usize, hop_length: usize, n_mels: usize, window: Vec<f32>, fb: Vec<f32>) -> Self {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(n_fft);
 
-        // torch.hann_window(n_fft) is *periodic* (denominator n_fft), not the
-        // symmetric window (denominator n_fft-1).
-        let window: Vec<f64> = (0..n_fft)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / n_fft as f64).cos())
-            })
-            .collect();
+        let n_freqs = n_fft / 2 + 1;
+        assert_eq!(window.len(), n_fft, "window length must equal n_fft");
+        assert_eq!(fb.len(), n_freqs * n_mels, "fb must be [n_fft/2+1, n_mels]");
 
-        let fb = melscale_fbanks(n_fft / 2 + 1, 0.0, sample_rate as f64 / 2.0, n_mels, sample_rate);
+        let window: Vec<f64> = window.into_iter().map(|w| w as f64).collect();
+        // Reshape flat row-major [n_freqs, n_mels] into [n_freqs][n_mels].
+        let mut fb2 = vec![vec![0f64; n_mels]; n_freqs];
+        for f in 0..n_freqs {
+            for m in 0..n_mels {
+                fb2[f][m] = fb[f * n_mels + m] as f64;
+            }
+        }
 
         MelSpectrogram {
             n_fft,
             hop_length,
             n_mels,
-            sample_rate,
             window,
-            fb,
+            fb: fb2,
             fft,
         }
     }
@@ -116,43 +122,4 @@ fn reflect_index(idx: isize, n: usize) -> usize {
         r = period - r;
     }
     r as usize
-}
-
-fn hz_to_mel_htk(freq: f64) -> f64 {
-    2595.0 * (1.0 + freq / 700.0).log10()
-}
-
-fn mel_to_hz_htk(mel: f64) -> f64 {
-    700.0 * (10.0_f64.powf(mel / 2595.0) - 1.0)
-}
-
-fn melscale_fbanks(
-    n_freqs: usize,
-    f_min: f64,
-    f_max: f64,
-    n_mels: usize,
-    _sample_rate: u32,
-) -> Vec<Vec<f64>> {
-    let m_min = hz_to_mel_htk(f_min);
-    let m_max = hz_to_mel_htk(f_max);
-    let m_pts: Vec<f64> = (0..n_mels + 2)
-        .map(|i| m_min + (m_max - m_min) * i as f64 / (n_mels + 1) as f64)
-        .collect();
-    let f_pts: Vec<f64> = m_pts.iter().map(|&m| mel_to_hz_htk(m)).collect();
-
-    let all_freqs: Vec<f64> = (0..n_freqs)
-        .map(|i| i as f64 * f_max / (n_freqs - 1) as f64)
-        .collect();
-
-    let mut fb = vec![vec![0.0f64; n_mels]; n_freqs];
-
-    for f in 0..n_freqs {
-        for m in 0..n_mels {
-            let up = (all_freqs[f] - f_pts[m]) / (f_pts[m + 1] - f_pts[m]);
-            let down = (f_pts[m + 2] - all_freqs[f]) / (f_pts[m + 2] - f_pts[m + 1]);
-            fb[f][m] = up.min(down).max(0.0);
-        }
-    }
-
-    fb
 }

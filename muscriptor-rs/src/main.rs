@@ -177,7 +177,8 @@ fn run_file(
     let input = cli.input.as_ref().ok_or("--input required for file mode")?;
     let max_shift = 1001;
     let vocab = build_event_vocab(max_shift);
-    let mel_spec = mel::MelSpectrogram::new(16000, 2048, 160, 512);
+    // Mel front-end with window/filterbank loaded from the checkpoint.
+    let mel_spec = model.mel();
 
     let inst_tokens = inst_names.as_ref().map(|names| instrument_group_from_names(names).unwrap_or_default());
 

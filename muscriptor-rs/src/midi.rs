@@ -47,7 +47,11 @@ pub fn notes_to_midi(notes: &[Note], velocity: u8, tempo_bpm: u16) -> Vec<u8> {
 
     for (time, pitch, program, is_on) in &midi_events {
         let tick = tick_from_sec(*time);
-        let delta = tick.saturating_sub(last_tick);
+        // The delta belongs to whichever message is emitted first at this time.
+        // If a program-change is written here it consumes the delta, so the
+        // note that follows must use delta 0 — otherwise the time is counted
+        // twice and every later event is offset by the first note's timestamp.
+        let mut delta = tick.saturating_sub(last_tick);
         last_tick = tick;
 
         let channel: u8;
@@ -56,16 +60,19 @@ pub fn notes_to_midi(notes: &[Note], velocity: u8, tempo_bpm: u16) -> Vec<u8> {
                 write_vlq(&mut track_data, delta);
                 track_data.extend_from_slice(&[0xC9, 0x00]); // program change ch 9, prog 0
                 drums_initialized = true;
+                delta = 0;
             }
             channel = 9;
+        } else if let Some(&ch) = program_to_channel.get(program) {
+            channel = ch;
         } else {
-            channel = *program_to_channel.entry(*program).or_insert_with(|| {
-                let ch = if available_channels.is_empty() { 15 } else { available_channels.remove(0) };
-                write_vlq(&mut track_data, delta);
-                track_data.push(0xC0 | ch); // program change
-                track_data.push(*program);
-                ch
-            });
+            let ch = if available_channels.is_empty() { 15 } else { available_channels.remove(0) };
+            write_vlq(&mut track_data, delta);
+            track_data.push(0xC0 | ch); // program change
+            track_data.push(*program);
+            program_to_channel.insert(*program, ch);
+            channel = ch;
+            delta = 0;
         }
 
         write_vlq(&mut track_data, delta);

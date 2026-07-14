@@ -10,7 +10,6 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, Sender};
 
-use crate::mel::MelSpectrogram;
 use crate::model::LMModel;
 use crate::vocab::{
     build_event_vocab, decode_tokens, events_to_notes, instrument_group_from_names, Event, Note,
@@ -23,7 +22,6 @@ const BUFFER_CAPACITY: usize = SAMPLE_RATE as usize * 30; // 30s
 
 pub struct RealtimeTranscriber {
     model: LMModel,
-    mel_spec: MelSpectrogram,
     vocab: Vec<Event>,
     inst_tokens: Option<String>,
     max_gen_len: usize,
@@ -43,11 +41,10 @@ impl RealtimeTranscriber {
         top_k: usize,
         top_p: f64,
     ) -> Self {
-        let mel_spec = MelSpectrogram::new(SAMPLE_RATE, 2048, 160, 512);
         let vocab = build_event_vocab(1001);
         let inst_tokens = inst_names
             .map(|names| instrument_group_from_names(&names).unwrap_or_default());
-        Self { model, mel_spec, vocab, inst_tokens, max_gen_len, sampling, temperature, top_k, top_p }
+        Self { model, vocab, inst_tokens, max_gen_len, sampling, temperature, top_k, top_p }
     }
 
     /// Process one audio chunk (16 kHz mono f32) and return detected notes.
@@ -64,8 +61,8 @@ impl RealtimeTranscriber {
         let mut audio_buf = chunk_audio.to_vec();
         audio_buf.resize(target_len, 0.0);
 
-        let raw_mel = self.mel_spec.compute(&audio_buf);
-        let log_mel = self.mel_spec.log_mel(&raw_mel, 1e-6);
+        let raw_mel = self.model.mel().compute(&audio_buf);
+        let log_mel = self.model.mel().log_mel(&raw_mel, 1e-6);
         let t_frames = log_mel.len();
         let mel_flat: Vec<f32> = log_mel.into_iter().flatten().collect();
         let mel_t = candle_core::Tensor::from_vec(

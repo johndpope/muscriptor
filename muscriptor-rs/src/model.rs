@@ -274,10 +274,17 @@ impl TF {
 // Conditioners
 // ---------------------------------------------------------------------------
 
-struct MelC { proj: LinB, dim: usize }
+struct MelC { proj: LinB, dim: usize, mel: crate::mel::MelSpectrogram }
 impl MelC {
     fn new(od: usize, vb: &VarBuilder) -> Result<Self> {
-        Ok(Self { proj: LinB::new(512, od, vb, "output_proj")?, dim: od })
+        // Load the Hann window and HTK filterbank straight from the checkpoint
+        // buffers so the mel front-end matches the reference bit-for-bit.
+        let window = vb.get(2048, "mel_spec_transform.spectrogram.window")?
+            .to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let fb = vb.get((1025, 512), "mel_spec_transform.mel_scale.fb")?
+            .to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let mel = crate::mel::MelSpectrogram::new(2048, 160, 512, window, fb);
+        Ok(Self { proj: LinB::new(512, od, vb, "output_proj")?, dim: od, mel })
     }
     fn forward(&self, m: &Tensor) -> Result<(Tensor, Tensor)> {
         let nd = m.dims().len();
@@ -307,11 +314,14 @@ impl ClsC {
         let mut data = Vec::with_capacity(b * ml);
         for c in inp {
             match c {
+                // Reference offsets class ids by +2 (tokenizer +1, forward +1),
+                // so raw class `c` lands on embedding row `c+2` and the null
+                // (unconditional) class lands on row 1.
                 Some(v) => {
-                    for &x in v { data.push(x + 1); }
-                    data.resize(data.len() + (ml - v.len()), 0i64);
+                    for &x in v { data.push(x + 2); }
+                    data.resize(data.len() + (ml - v.len()), 1i64);
                 }
-                None => { data.resize(data.len() + ml, 0i64); }
+                None => { data.resize(data.len() + ml, 1i64); }
             }
         }
         Tensor::from_vec(data, (b, ml), dev)
@@ -360,6 +370,9 @@ impl LMModel {
         Ok(m)
     }
 
+    /// The mel front-end, with window/filterbank loaded from the checkpoint.
+    pub fn mel(&self) -> &crate::mel::MelSpectrogram { &self.mc.mel }
+
     pub fn new(vb: &VarBuilder, cfg: &ModelConfig) -> Result<Self> {
         Ok(Self {
             emb: ScaledEmb::new(cfg.card + 1, cfg.dim, &vb.pp("emb"))?,
@@ -386,7 +399,11 @@ impl LMModel {
             let (mc, _) = self.mc.forward(mel)?;
             let (ic, _) = self.ic.forward(inst)?;
             let (dc, _) = self.dc.forward(ds)?;
-            h = Tensor::cat(&[&ic, &dc, &mc, &h], 1)?;
+            // Prefix order must match the Python reference. There the
+            // condition dict is {instrument, dataset, self_wav} but each is
+            // cat'd to the *front*, so the final prefix is the reverse:
+            // [mel, dataset, instrument, tokens].
+            h = Tensor::cat(&[&mc, &dc, &ic, &h], 1)?;
             pl = h.dim(1)? - s;
         }
         // Absolute position of the tokens being processed = number of
