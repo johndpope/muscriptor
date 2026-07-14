@@ -2,6 +2,30 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::fs;
 
+/// Resolve a HuggingFace token: the `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` env
+/// vars first, then the standard token file written by `hf auth login`
+/// (`$HF_HOME/token` or `~/.cache/huggingface/token`).
+fn hf_token() -> Option<String> {
+    for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+        if let Ok(t) = std::env::var(var) {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    let token_path = std::env::var("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache")
+                .join("huggingface")
+        })
+        .join("token");
+    fs::read_to_string(token_path).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
 pub fn download_weights(url: &str) -> Result<PathBuf, DownloadError> {
     let cache_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -31,7 +55,7 @@ pub fn download_weights(url: &str) -> Result<PathBuf, DownloadError> {
 
     log::info!("Downloading {} from {} ...", filename, api_url);
 
-    let token = std::env::var("HF_TOKEN").ok();
+    let token = hf_token();
     let make_req = || {
         let req = ureq::get(&api_url);
         if let Some(t) = &token {
