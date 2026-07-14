@@ -6,7 +6,7 @@ use std::fs;
 /// vars first, then the standard token file written by `hf auth login`
 /// (`$HF_HOME/token` or `~/.cache/huggingface/token`).
 fn hf_token() -> Option<String> {
-    for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+    for var in ["HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
         if let Ok(t) = std::env::var(var) {
             let t = t.trim().to_string();
             if !t.is_empty() {
@@ -67,12 +67,25 @@ pub fn download_weights(url: &str) -> Result<PathBuf, DownloadError> {
     let resp = match make_req().call() {
         Ok(r) => r,
         Err(ureq::Error::Status(code, _)) => {
-            if code == 403 {
+            // 401 = no/invalid token was sent; 403 = authenticated but the
+            // gated repo's terms haven't been accepted for this account.
+            if code == 401 || code == 403 {
+                let had_token = token.is_some();
+                let cause = if code == 401 && !had_token {
+                    "no HuggingFace token was found"
+                } else if code == 401 {
+                    "the HuggingFace token was rejected (invalid or expired)"
+                } else {
+                    "your account hasn't been granted access to this gated model"
+                };
                 return Err(DownloadError::Auth(format!(
-                    "Cannot download '{}': the MuScriptor model weights are gated. \
-                     Visit https://huggingface.co/{} and accept the terms, \
-                     then set HF_TOKEN or run `huggingface-cli login`.",
-                    repo_id, repo_id
+                    "Cannot download '{repo_id}' (HTTP {code}): {cause}.\n\
+                     1. Accept the license at https://huggingface.co/{repo_id}\n\
+                     2. Provide a token (create one at https://huggingface.co/settings/tokens), either:\n\
+                     \x20     export HUGGINGFACE_TOKEN=hf_...   (also accepts HF_TOKEN / HUGGING_FACE_HUB_TOKEN)\n\
+                     \x20  or run `hf auth login` (writes ~/.cache/huggingface/token, which this tool reads).\n\
+                     (Token source: {}.)",
+                    if had_token { "a token was found but the server rejected it" } else { "none found in env vars or ~/.cache/huggingface/token" }
                 )));
             }
             return Err(DownloadError::Http(format!("status code {}", code)));
