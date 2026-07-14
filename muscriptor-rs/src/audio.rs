@@ -49,7 +49,7 @@ pub fn load_audio(path: &Path, target_sr: u32) -> Result<Vec<f32>, AudioError> {
 }
 
 /// Simple linear interpolation resampler
-fn resample(input: &[f32], orig_sr: u32, target_sr: u32) -> Vec<f32> {
+pub fn resample(input: &[f32], orig_sr: u32, target_sr: u32) -> Vec<f32> {
     if orig_sr == target_sr {
         return input.to_vec();
     }

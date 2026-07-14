@@ -1,123 +1,144 @@
-use crate::vocab::{Note, DRUM_PROGRAM};
-use std::collections::HashMap;
+//! Standard MIDI File (format 0) serialization of decoded notes, matching the
+//! reference `note_event2midi` (mido-based) byte for byte: same event
+//! ordering, channel assignment, running status and end-of-track handling.
 
-/// Write MIDI file bytes from notes.
-/// Uses raw MIDI byte construction for reliability.
-pub fn notes_to_midi(notes: &[Note], velocity: u8, tempo_bpm: u16) -> Vec<u8> {
-    let ticks_per_beat: u16 = 480;
-    let tempo_us: u32 = 60_000_000 / tempo_bpm as u32;
+use crate::tokenizer::{Note, DRUM_PROGRAM};
 
-    // Build sorted note-on/off events: (time_sec, pitch, program, is_on)
-    let mut midi_events: Vec<(f64, u8, u8, bool)> = Vec::new();
-    for note in notes {
-        if note.is_drum {
-            midi_events.push((note.onset, note.pitch, DRUM_PROGRAM, true));
-            midi_events.push((note.offset, note.pitch, DRUM_PROGRAM, false));
-        } else {
-            midi_events.push((note.onset, note.pitch, note.program, true));
-            midi_events.push((note.offset, note.pitch, note.program, false));
-        }
-    }
-    midi_events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+const TICKS_PER_BEAT: u32 = 480;
+const TEMPO_US: f64 = 500_000.; // 120 bpm
+const VELOCITY: u8 = 100;
 
-    // Convert to MIDI ticks
-    let tick_from_sec = |sec: f64| -> u32 {
-        (sec * 1_000_000.0 / tempo_us as f64 * ticks_per_beat as f64) as u32
-    };
-
-    // We'll construct MIDI as raw bytes
-    let mut buf = Vec::new();
-
-    // Header: MThd, length=6, format=1, ntrks=1, division
-    let division: u16 = ticks_per_beat;
-    write_midi_header(&mut buf, 1, 1, division);
-
-    // Track chunk
-    let mut track_data = Vec::new();
-
-    // Tempo meta event
-    write_vlq(&mut track_data, 0); // delta
-    track_data.extend_from_slice(&[0xFF, 0x51, 0x03]);
-    track_data.extend_from_slice(&[(tempo_us >> 16) as u8, (tempo_us >> 8) as u8, tempo_us as u8]);
-
-    let mut program_to_channel: HashMap<u8, u8> = HashMap::new();
-    let mut available_channels: Vec<u8> = (0..9).chain(10..16).collect();
-    let mut drums_initialized = false;
-    let mut last_tick: u32 = 0;
-
-    for (time, pitch, program, is_on) in &midi_events {
-        let tick = tick_from_sec(*time);
-        // The delta belongs to whichever message is emitted first at this time.
-        // If a program-change is written here it consumes the delta, so the
-        // note that follows must use delta 0 — otherwise the time is counted
-        // twice and every later event is offset by the first note's timestamp.
-        let mut delta = tick.saturating_sub(last_tick);
-        last_tick = tick;
-
-        let channel: u8;
-        if *program == DRUM_PROGRAM {
-            if !drums_initialized {
-                write_vlq(&mut track_data, delta);
-                track_data.extend_from_slice(&[0xC9, 0x00]); // program change ch 9, prog 0
-                drums_initialized = true;
-                delta = 0;
-            }
-            channel = 9;
-        } else if let Some(&ch) = program_to_channel.get(program) {
-            channel = ch;
-        } else {
-            let ch = if available_channels.is_empty() { 15 } else { available_channels.remove(0) };
-            write_vlq(&mut track_data, delta);
-            track_data.push(0xC0 | ch); // program change
-            track_data.push(*program);
-            program_to_channel.insert(*program, ch);
-            channel = ch;
-            delta = 0;
-        }
-
-        write_vlq(&mut track_data, delta);
-        if *is_on {
-            track_data.push(0x90 | channel);
-            track_data.push(*pitch);
-            track_data.push(velocity);
-        } else {
-            track_data.push(0x80 | channel);
-            track_data.push(*pitch);
-            track_data.push(0);
-        }
-    }
-
-    // End of track
-    write_vlq(&mut track_data, 0);
-    track_data.extend_from_slice(&[0xFF, 0x2F, 0x00]);
-
-    write_midi_track(&mut buf, &track_data);
-    buf
+#[derive(Debug, Clone)]
+struct MidiEvent {
+    is_drum: bool,
+    program: i32,
+    time: f64,
+    /// 1 for onset, 0 for offset.
+    velocity: u8,
+    pitch: u8,
 }
 
-fn write_vlq(buf: &mut Vec<u8>, mut value: u32) {
-    // Build in reverse order
-    let mut bytes = Vec::new();
-    bytes.push((value & 0x7F) as u8);
+fn second2tick(second: f64) -> i64 {
+    (second * TICKS_PER_BEAT as f64 * 1e6 / TEMPO_US).round_ties_even() as i64
+}
+
+fn push_varlen(out: &mut Vec<u8>, mut value: u64) {
+    let mut bytes = vec![(value & 0x7f) as u8];
     value >>= 7;
     while value > 0 {
-        bytes.push(0x80 | ((value & 0x7F) as u8));
+        bytes.push((value & 0x7f) as u8 | 0x80);
         value >>= 7;
     }
     bytes.reverse();
-    buf.extend_from_slice(&bytes);
+    out.extend(bytes);
 }
 
-fn write_midi_header(buf: &mut Vec<u8>, format: u16, ntrks: u16, division: u16) {
-    buf.extend_from_slice(b"MThd");
-    buf.extend_from_slice(&6u32.to_be_bytes());
-    buf.extend_from_slice(&format.to_be_bytes());
-    buf.extend_from_slice(&ntrks.to_be_bytes());
-    buf.extend_from_slice(&division.to_be_bytes());
-}
+/// Serialize notes to a single-track (format 0) MIDI file.
+pub fn notes_to_midi_bytes(notes: &[Note]) -> Vec<u8> {
+    // Notes to on/off events; drums get only an onset here...
+    let mut events = Vec::with_capacity(notes.len() * 2);
+    for note in notes {
+        events.push(MidiEvent {
+            is_drum: note.is_drum,
+            program: note.program,
+            time: note.onset,
+            velocity: 1,
+            pitch: note.pitch,
+        });
+        if !note.is_drum {
+            events.push(MidiEvent {
+                is_drum: false,
+                program: note.program,
+                time: note.offset,
+                velocity: 0,
+                pitch: note.pitch,
+            });
+        }
+    }
+    // ...and a synthetic offset 10ms after each drum hit.
+    let drum_offsets: Vec<MidiEvent> = events
+        .iter()
+        .filter(|ev| ev.is_drum)
+        .map(|ev| MidiEvent {
+            time: ev.time + 0.01,
+            velocity: 0,
+            ..ev.clone()
+        })
+        .collect();
+    events.extend(drum_offsets);
+    events.sort_by(|a, b| {
+        a.time
+            .total_cmp(&b.time)
+            .then(a.is_drum.cmp(&b.is_drum))
+            .then(a.program.cmp(&b.program))
+            .then(a.velocity.cmp(&b.velocity))
+            .then(a.pitch.cmp(&b.pitch))
+    });
 
-fn write_midi_track(buf: &mut Vec<u8>, data: &[u8]) {
-    buf.extend_from_slice(b"MTrk");
-    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    buf.extend_from_slice(data);
+    let mut track: Vec<u8> = Vec::new();
+    let mut running_status: Option<u8> = None;
+    let mut push_message = |track: &mut Vec<u8>, delta: u64, status: u8, data: &[u8]| {
+        push_varlen(track, delta);
+        if running_status != Some(status) {
+            track.push(status);
+            running_status = Some(status);
+        }
+        track.extend_from_slice(data);
+    };
+
+    // Programs are assigned channels 0-8, 10-15 in order of first appearance;
+    // drums always use channel 9. Overflow falls back to channel 15.
+    let mut program_to_channel: std::collections::HashMap<i32, u8> = Default::default();
+    let mut available_channels: std::collections::VecDeque<u8> = (0..9).chain(10..16).collect();
+    let mut drums_initialized = false;
+    let mut current_tick = 0i64;
+    for ev in &events {
+        let absolute_tick = second2tick(ev.time);
+        let mut delta_tick = (absolute_tick - current_tick).max(0) as u64;
+        current_tick = current_tick.max(absolute_tick);
+
+        let channel = match program_to_channel.get(&ev.program) {
+            Some(&ch) => ch,
+            None if ev.program == DRUM_PROGRAM || ev.is_drum => {
+                if !drums_initialized {
+                    push_message(&mut track, delta_tick, 0xc9, &[0]);
+                    delta_tick = 0;
+                    drums_initialized = true;
+                }
+                9
+            }
+            None => {
+                let ch = available_channels.pop_front().unwrap_or(15);
+                program_to_channel.insert(ev.program, ch);
+                push_message(&mut track, delta_tick, 0xc0 | ch, &[ev.program as u8]);
+                delta_tick = 0;
+                ch
+            }
+        };
+
+        let (status_nibble, velocity) = if ev.velocity > 0 {
+            (0x90u8, VELOCITY)
+        } else {
+            (0x80u8, 0)
+        };
+        push_message(
+            &mut track,
+            delta_tick,
+            status_nibble | channel,
+            &[ev.pitch, velocity],
+        );
+    }
+    // End of track meta event.
+    track.extend_from_slice(&[0x00, 0xff, 0x2f, 0x00]);
+
+    let mut out = Vec::with_capacity(track.len() + 22);
+    out.extend_from_slice(b"MThd");
+    out.extend_from_slice(&6u32.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // format 0
+    out.extend_from_slice(&1u16.to_be_bytes()); // one track
+    out.extend_from_slice(&(TICKS_PER_BEAT as u16).to_be_bytes());
+    out.extend_from_slice(b"MTrk");
+    out.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    out.extend_from_slice(&track);
+    out
 }

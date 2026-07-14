@@ -1,86 +1,88 @@
-mod config;
 mod audio;
-mod mel;
-mod model;
-mod vocab;
-mod midi;
+mod config;
 mod download;
+mod mel;
+mod midi;
+mod model;
+mod sampling;
+mod tokenizer;
 #[cfg(feature = "realtime")]
 mod realtime;
 
 use std::path::PathBuf;
 use std::time::Instant;
 
+use candle_core::{DType, Device};
+use candle_nn::VarBuilder;
 use clap::Parser;
-use candle_core::{Device, Tensor};
 
 use config::{ModelConfig, DEFAULT_CONFIGS};
-use vocab::{build_event_vocab, decode_tokens, events_to_notes, instrument_group_from_names,
-    tie_section_token_ids, OpenNoteTracker, FRAME_RATE};
+use model::{Config, GenerateOptions, Model, SAMPLE_RATE, SEGMENT_DURATION, FRAME_RATE};
+use sampling::Sampling;
 
-/// MuScriptor-rs: Audio-to-MIDI transcription in Rust
+/// MuScriptor-rs: audio-to-MIDI transcription in Rust (candle port).
 #[derive(Parser)]
 #[command(name = "muscriptor-rs", version)]
 struct Cli {
-    /// Path to input audio file (WAV); omit with --mic for live capture
+    /// Input audio file (WAV). Omit with --mic for live capture.
     #[arg(short, long)]
     input: Option<PathBuf>,
 
-    /// Path to output MIDI file (default: <input>.mid); with --mic, notes go to stdout
+    /// Output MIDI file (default: <input>.mid). With --mic, notes go to stdout.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Live microphone capture mode
+    /// Live microphone capture mode.
     #[arg(long)]
     mic: bool,
 
-    /// Model size: small, medium, large (default: medium)
+    /// Model size: small, medium, large (default: medium).
     #[arg(short = 'm', long, default_value = "medium")]
     model: String,
 
-    /// Path to local model.safetensors (overrides --model)
+    /// Path to local model.safetensors (overrides --model).
     #[arg(long)]
     weights: Option<PathBuf>,
 
-    /// Instrument names to condition on (comma-separated)
+    /// Instrument names to condition on (comma-separated, e.g. acoustic_piano,drums).
     #[arg(short = 'I', long)]
     instruments: Option<String>,
 
-    /// Use sampling instead of greedy decoding
+    /// Use temperature sampling instead of greedy decoding.
     #[arg(long)]
     sampling: bool,
 
-    /// Sampling temperature
-    #[arg(long, default_value = "1.0")]
+    /// Sampling temperature (only with --sampling).
+    #[arg(short = 't', long, default_value = "1.0")]
     temperature: f64,
 
-    /// Top-k sampling
-    #[arg(long, default_value = "0")]
-    top_k: usize,
+    /// Top-k sampling (only with --sampling).
+    #[arg(long)]
+    top_k: Option<usize>,
 
-    /// Top-p sampling
-    #[arg(long, default_value = "0.0")]
-    top_p: f64,
+    /// Top-p / nucleus sampling (only with --sampling; wins over top-k).
+    #[arg(long)]
+    top_p: Option<f64>,
 
-    /// Use CPU only
+    /// RNG seed for --sampling.
+    #[arg(long, default_value = "299792458")]
+    seed: u64,
+
+    /// Use CPU only.
     #[arg(long)]
     cpu: bool,
 
-    /// Maximum generation length per chunk
+    /// Maximum generated tokens per chunk.
     #[arg(long, default_value = "2000")]
     max_gen_len: usize,
 
-    /// Disable prelude forcing (teacher-forcing each chunk's tie prologue from
-    /// the previous chunk's still-open notes, so chunks can't restart sustained
-    /// notes with the wrong instrument). On by default (batch size 1 only).
-    #[arg(long = "no-prelude-forcing", action = clap::ArgAction::SetTrue)]
-    no_prelude_forcing: bool,
-
-    /// Number of 5-second chunks transcribed per forward pass. Higher values
-    /// use the GPU better but disable prelude forcing. Default: 4 on GPU, 1 on
-    /// CPU.
+    /// Chunks transcribed per forward pass. Default: 4 on GPU, 1 on CPU.
     #[arg(long)]
     batch_size: Option<usize>,
+
+    /// Print decoded note events to stderr.
+    #[arg(long)]
+    notes: bool,
 }
 
 fn load_device(cpu: bool) -> Device {
@@ -88,8 +90,6 @@ fn load_device(cpu: bool) -> Device {
         log::info!("Using CPU device");
         return Device::Cpu;
     }
-    // Try CUDA first, then Metal. Only the backend compiled in via cargo
-    // features can succeed; the others report as unavailable and fall through.
     let dev = Device::cuda_if_available(0)
         .or_else(|_| Device::metal_if_available(0))
         .unwrap_or(Device::Cpu);
@@ -129,16 +129,33 @@ fn resolve_config(model_size: &str, weights: &Option<PathBuf>) -> Result<ModelCo
         .ok_or_else(|| format!("Unknown model size: {model_size}. Use small, medium, or large.").into())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
-    let cli = Cli::parse();
+fn build_options(cli: &Cli) -> GenerateOptions {
+    let sampling = if !cli.sampling || cli.temperature <= 0.0 {
+        None
+    } else {
+        let temperature = cli.temperature;
+        Some(match (cli.top_p.filter(|&p| p > 0.0), cli.top_k.filter(|&k| k > 0)) {
+            (Some(p), _) => Sampling::TopP { p, temperature },
+            (None, Some(k)) => Sampling::TopK { k, temperature },
+            (None, None) => Sampling::All { temperature },
+        })
+    };
+    GenerateOptions { max_gen_len: cli.max_gen_len, sampling, seed: cli.seed }
+}
 
-    let device = load_device(cli.cpu);
-    log::info!("Using device: {:?}", device);
-
-    let cfg = resolve_config(&cli.model, &cli.weights)?;
-    log::info!("Model config: {} layers, {} dim, {} heads, {} card",
-        cfg.num_layers, cfg.dim, cfg.num_heads, cfg.card);
+/// Load weights + config and build the model (f32; conditioners always f32).
+fn load_model(cli: &Cli, device: &Device) -> Result<Model, Box<dyn std::error::Error>> {
+    let mcfg = resolve_config(&cli.model, &cli.weights)?;
+    log::info!(
+        "Model config: {} layers, {} dim, {} heads, {} card",
+        mcfg.num_layers, mcfg.dim, mcfg.num_heads, mcfg.card
+    );
+    let config = Config {
+        dim: mcfg.dim,
+        num_heads: mcfg.num_heads,
+        num_layers: mcfg.num_layers,
+        card: mcfg.card,
+    };
 
     let weights_path = if let Some(ref wp) = cli.weights {
         wp.clone()
@@ -148,208 +165,174 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     log::info!("Weights: {}", weights_path.display());
 
-    log::info!("Loading model...");
     let t0 = Instant::now();
-    let model = model::LMModel::load(&weights_path, &cfg, &device)?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights_path], DType::F32, device)? };
+    let vb_f32 = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights_path], DType::F32, device)? };
+    let model = Model::new(&config, vb, vb_f32)?;
     log::info!("Model loaded in {:.2}s", t0.elapsed().as_secs_f64());
+    Ok(model)
+}
 
-    let inst_names: Option<Vec<String>> = cli.instruments.as_ref().map(|s| {
-        s.split(',').map(|s| s.trim().to_string()).collect()
-    });
+fn instrument_ids(cli: &Cli) -> Result<Option<Vec<u32>>, Box<dyn std::error::Error>> {
+    match &cli.instruments {
+        None => Ok(None),
+        Some(s) => {
+            let names: Vec<&str> = s.split(',').map(|n| n.trim()).filter(|n| !n.is_empty()).collect();
+            if names.is_empty() {
+                return Ok(None);
+            }
+            let ids = tokenizer::instrument_class_ids(&names).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            log::info!("Instruments: {}", names.join(", "));
+            Ok(Some(ids))
+        }
+    }
+}
+
+fn print_event(ev: &tokenizer::NoteEvent) {
+    match ev {
+        tokenizer::NoteEvent::Start(s) => eprintln!(
+            "NoteStart(pitch={}, t={:.2}, idx={}, instr={})",
+            s.pitch, s.start_time, s.index, s.instrument
+        ),
+        tokenizer::NoteEvent::End { end_time, start_index } => {
+            eprintln!("NoteEnd(t={end_time:.2}, start_index={start_index})")
+        }
+    }
+}
+
+fn run_file(mut model: Model, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let input = cli.input.as_ref().ok_or("--input required for file mode")?;
+    let inst_ids = instrument_ids(cli)?;
+    let opts = build_options(cli);
+
+    log::info!("Loading audio: {}", input.display());
+    let pcm = audio::load_audio(input, SAMPLE_RATE as u32)?;
+    let segment_samples = (SEGMENT_DURATION * SAMPLE_RATE as f64) as usize;
+    let num_chunks = pcm.len().div_ceil(segment_samples).max(1);
+    log::info!(
+        "Audio: {:.1}s -> {} chunk(s) of {}s",
+        pcm.len() as f64 / SAMPLE_RATE as f64, num_chunks, SEGMENT_DURATION
+    );
+    let chunks: Vec<Vec<f32>> = (0..num_chunks)
+        .map(|i| {
+            let start = i * segment_samples;
+            let mut c = pcm[start..(start + segment_samples).min(pcm.len())].to_vec();
+            c.resize(segment_samples, 0.0);
+            c
+        })
+        .collect();
+
+    let batch_size = cli.batch_size.unwrap_or(if model.device().is_cpu() { 1 } else { 4 }).max(1);
+    log::info!("Batch size {}", batch_size);
+
+    let seek_time = |i: usize| i as f64 * SEGMENT_DURATION;
+    let next_seek = |i: usize| (i + 1 < num_chunks).then(|| seek_time(i + 1));
+
+    let mut decoder = tokenizer::TokenDecoder::new(FRAME_RATE);
+    let mut all_events: Vec<tokenizer::NoteEvent> = Vec::new();
+    let mut emitted = 0usize; // index into all_events already printed
+
+    let gen_start = Instant::now();
+    for batch_start in (0..num_chunks).step_by(batch_size) {
+        let batch = &chunks[batch_start..(batch_start + batch_size).min(num_chunks)];
+        let n = batch.len();
+        let prefix = model.build_prefix(batch, inst_ids.as_deref())?;
+
+        // The model emits one token per chunk per step; the decoder consumes
+        // whole chunks in order, so the first chunk streams live while later
+        // ones buffer until every earlier chunk has hit EOS.
+        let mut buffers: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut done = vec![false; n];
+        let mut active = 0usize;
+        decoder.start_chunk(seek_time(batch_start), next_seek(batch_start), &mut all_events);
+
+        model.generate(&prefix, &opts, |tokens| {
+            for (j, &tok) in tokens.iter().enumerate() {
+                if done[j] {
+                    continue;
+                }
+                if tok == tokenizer::EOS_ID {
+                    done[j] = true;
+                } else if j == active {
+                    decoder.push(tok, &mut all_events);
+                } else {
+                    buffers[j].push(tok);
+                }
+            }
+            while active < n && done[active] {
+                active += 1;
+                if active < n {
+                    decoder.start_chunk(seek_time(batch_start + active), next_seek(batch_start + active), &mut all_events);
+                    let buffered = std::mem::take(&mut buffers[active]);
+                    for tok in buffered {
+                        decoder.push(tok, &mut all_events);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        // Chunks after `active` never got their turn (an earlier chunk hit the
+        // token cap without EOS): start and flush them in order.
+        for j in (active + 1)..n {
+            decoder.start_chunk(seek_time(batch_start + j), next_seek(batch_start + j), &mut all_events);
+            let buffered = std::mem::take(&mut buffers[j]);
+            for tok in buffered {
+                decoder.push(tok, &mut all_events);
+            }
+        }
+        for (j, d) in done.iter().enumerate() {
+            if !d {
+                log::warn!("chunk {} did not emit EOS within {} tokens", batch_start + j, cli.max_gen_len);
+            }
+        }
+        if cli.notes {
+            for ev in &all_events[emitted..] {
+                print_event(ev);
+            }
+            emitted = all_events.len();
+        }
+        log::info!("chunks {}/{} ({:.2}s)", batch_start + n, num_chunks, gen_start.elapsed().as_secs_f64());
+    }
+    decoder.finish(&mut all_events);
+    if cli.notes {
+        for ev in &all_events[emitted..] {
+            print_event(ev);
+        }
+    }
+
+    let notes = tokenizer::events_to_notes(&all_events);
+    log::info!("Transcribed {} notes ({:.2}s total)", notes.len(), gen_start.elapsed().as_secs_f64());
+
+    let midi_bytes = midi::notes_to_midi_bytes(&notes);
+    let output = cli.output.clone().unwrap_or_else(|| input.with_extension("mid"));
+    std::fs::write(&output, &midi_bytes)?;
+    log::info!("Wrote {} note(s) to {}", notes.len(), output.display());
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    let cli = Cli::parse();
+
+    let device = load_device(cli.cpu);
+    let model = load_model(&cli, &device)?;
 
     if cli.mic {
         #[cfg(feature = "realtime")]
         {
-            run_realtime(model, &cli, inst_names)?;
+            let inst_ids = instrument_ids(&cli)?;
+            let opts = build_options(&cli);
+            realtime::run_realtime(model, inst_ids, opts)?;
         }
         #[cfg(not(feature = "realtime"))]
         {
-            let _ = (model, inst_names);
+            let _ = model;
             return Err("--mic requires building with the `realtime` feature \
                         (cargo build --release --features realtime,cuda)".into());
         }
     } else {
-        run_file(model, &cli, inst_names)?;
+        run_file(model, &cli)?;
     }
-
-    Ok(())
-}
-
-fn run_file(
-    model: model::LMModel,
-    cli: &Cli,
-    inst_names: Option<Vec<String>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let input = cli.input.as_ref().ok_or("--input required for file mode")?;
-    let max_shift = 1001;
-    let vocab = build_event_vocab(max_shift);
-    // Mel front-end with window/filterbank loaded from the checkpoint.
-    let mel_spec = model.mel();
-
-    let inst_tokens = inst_names.as_ref().map(|names| instrument_group_from_names(names).unwrap_or_default());
-
-    log::info!("Loading audio: {}", input.display());
-    let t0 = Instant::now();
-    let audio = audio::load_audio(input, 16000)?;
-    let total_secs = audio.len() as f64 / 16000.0;
-    log::info!("Audio loaded: {:.1}s ({:.2}ms)", total_secs, t0.elapsed().as_secs_f64());
-
-    let segment_dur = 5.0f64;
-    let segment_samples = (segment_dur * 16000.0) as usize;
-    let num_chunks = (audio.len() + segment_samples - 1) / segment_samples;
-    log::info!("Processing {} chunks of {}s", num_chunks, segment_dur);
-
-    let mut all_tokens: Vec<(usize, Vec<i64>)> = Vec::new();
-
-    let inst_option: Option<Vec<i64>> = inst_tokens.as_ref().map(|s| {
-        s.split_whitespace().filter_map(|v| v.parse::<i64>().ok()).collect()
-    });
-    let dev = model.device.clone();
-
-    // Batch size: how many 5s chunks share a forward pass. Prelude forcing
-    // needs strictly in-order chunks, so it only runs at batch size 1 (matching
-    // the reference).
-    let batch_size = cli.batch_size.unwrap_or(if dev.is_cuda() { 4 } else { 1 }).max(1);
-    let prelude_forcing = !cli.no_prelude_forcing && batch_size == 1;
-    log::info!(
-        "Batch size {}{}",
-        batch_size,
-        if prelude_forcing { ", prelude forcing enabled" } else { "" }
-    );
-
-    // Log-mel prefix tensor [1, frames, 512] for one chunk (audio zero-padded
-    // to a full segment, so every chunk yields the same frame count).
-    let chunk_mel = |chunk_idx: usize| -> Result<Tensor, Box<dyn std::error::Error>> {
-        let start = chunk_idx * segment_samples;
-        let end = (start + segment_samples).min(audio.len());
-        let mut chunk_audio: Vec<f32> = audio[start..end].to_vec();
-        chunk_audio.resize(segment_samples, 0.0f32);
-        let raw = mel_spec.compute(&chunk_audio);
-        let log_mel = mel_spec.log_mel(&raw, 1e-6);
-        let t_frames = log_mel.len();
-        let flat: Vec<f32> = log_mel.into_iter().flatten().collect();
-        Ok(Tensor::from_vec(flat, (1, t_frames, 512), &dev)?)
-    };
-
-    if batch_size == 1 {
-        let inst_t = model.ic.tokenize(&[inst_option.clone()], &dev)?;
-        let ds_t = model.dc.tokenize(&[None], &dev)?;
-        let mut tracker = OpenNoteTracker::new(&vocab, FRAME_RATE);
-        for chunk_idx in 0..num_chunks {
-            log::info!("Chunk {}/{}", chunk_idx + 1, num_chunks);
-            let seek_time = chunk_idx as f64 * segment_dur;
-            let next_seek_time = if chunk_idx + 1 < num_chunks {
-                Some((chunk_idx + 1) as f64 * segment_dur)
-            } else {
-                None
-            };
-            // Settle the tracker on the boundary before reading its open notes.
-            tracker.feed_boundary(seek_time, next_seek_time);
-            let prompt: Vec<i64> = if prelude_forcing && chunk_idx > 0 {
-                tie_section_token_ids(&tracker.open_keys(), &vocab)
-            } else {
-                Vec::new()
-            };
-
-            let mel_t = chunk_mel(chunk_idx)?;
-            let t0 = Instant::now();
-            let tokens = model.generate(
-                &mel_t, &inst_t, &ds_t,
-                cli.max_gen_len, cli.sampling, cli.temperature,
-                cli.top_k, cli.top_p,
-                &prompt,
-            )?;
-            log::info!("  chunk {} -> {} tokens ({:.2}s)", chunk_idx + 1, tokens.len(), t0.elapsed().as_secs_f64());
-            // Feed the chunk's tokens so the tracker is ready for the next prologue.
-            for &t in &tokens { tracker.feed_token(t); }
-            all_tokens.push((chunk_idx, tokens));
-        }
-    } else {
-        for batch_start in (0..num_chunks).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(num_chunks);
-            let bs = batch_end - batch_start;
-            let mels: Vec<Tensor> = (batch_start..batch_end).map(chunk_mel).collect::<Result<_, _>>()?;
-            let mel_b = Tensor::cat(&mels, 0)?;
-            let inst_b = model.ic.tokenize(&vec![inst_option.clone(); bs], &dev)?;
-            let ds_b = model.dc.tokenize(&vec![None; bs], &dev)?;
-
-            let t0 = Instant::now();
-            let batch_tokens = model.generate_batch(
-                &mel_b, &inst_b, &ds_b,
-                cli.max_gen_len, cli.sampling, cli.temperature,
-            )?;
-            let total: usize = batch_tokens.iter().map(|t| t.len()).sum();
-            log::info!("  chunks {}-{} -> {} tokens ({:.2}s)", batch_start + 1, batch_end, total, t0.elapsed().as_secs_f64());
-            for (k, tokens) in batch_tokens.into_iter().enumerate() {
-                all_tokens.push((batch_start + k, tokens));
-            }
-        }
-    }
-
-    log::info!("Decoding tokens...");
-    let mut all_events = Vec::new();
-    for (chunk_idx, tokens) in &all_tokens {
-        let seek_time = *chunk_idx as f64 * segment_dur;
-        let next_seek_time = if chunk_idx + 1 < num_chunks {
-            Some((chunk_idx + 1) as f64 * segment_dur)
-        } else {
-            None
-        };
-        let events = decode_tokens(tokens, &vocab, seek_time, next_seek_time);
-        all_events.extend(events);
-    }
-
-    let notes = events_to_notes(&all_events);
-    log::info!("Transcribed {} notes", notes.len());
-
-    let output_path = cli.output.clone().unwrap_or_else(|| {
-        let mut p = input.clone();
-        p.set_extension("mid");
-        p
-    });
-    let midi_bytes = midi::notes_to_midi(&notes, 100, 120);
-    std::fs::write(&output_path, &midi_bytes)?;
-    log::info!("MIDI written to {}", output_path.display());
-    Ok(())
-}
-
-#[cfg(feature = "realtime")]
-fn run_realtime(
-    model: model::LMModel,
-    cli: &Cli,
-    inst_names: Option<Vec<String>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Starting realtime mic capture...");
-
-    let transcriber = realtime::RealtimeTranscriber::new(
-        model,
-        inst_names,
-        cli.max_gen_len,
-        cli.sampling,
-        cli.temperature,
-        cli.top_k,
-        cli.top_p,
-    );
-
-    let (_stream, rx) = realtime::start_mic_capture()?;
-    println!("🎤 Listening... Play music! Notes appear below.");
-    println!("format: start_time\\tpitch\\tduration\\tprogram");
-
-    for (chunk_audio, start_time) in rx {
-        match transcriber.transcribe_chunk(&chunk_audio, start_time) {
-            Ok(notes) => {
-                for note in &notes {
-                    let dur = note.offset - note.onset;
-                    println!("{:.3}\t{}\t{:.3}\t{}",
-                        note.onset, note.pitch, dur, note.program);
-                }
-                // Flush stdout so the Flutter subprocess can read lines
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-            }
-            Err(e) => eprintln!("Transcription error: {e}"),
-        }
-    }
-
     Ok(())
 }

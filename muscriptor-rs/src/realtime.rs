@@ -1,8 +1,9 @@
 //! Real-time microphone capture → streaming transcription.
-//! Captures audio from the default mic, buffers into overlapping chunks,
-//! and runs model inference on each chunk to emit detected notes.
+//! Captures audio from the default mic, buffers into overlapping chunks, and
+//! runs the model on each chunk to emit detected notes on stdout.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,93 +11,92 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, Sender};
 
-use crate::model::LMModel;
-use crate::vocab::{
-    build_event_vocab, decode_tokens, events_to_notes, instrument_group_from_names, Event, Note,
-};
+use crate::model::{GenerateOptions, Model, FRAME_RATE, SAMPLE_RATE, SEGMENT_DURATION};
+use crate::tokenizer::{self, Note};
 
-const SAMPLE_RATE: u32 = 16000;
 const CHUNK_DURATION_SECS: f64 = 4.0;
 const OVERLAP_SECS: f64 = 1.0;
-const BUFFER_CAPACITY: usize = SAMPLE_RATE as usize * 30; // 30s
 
 pub struct RealtimeTranscriber {
-    model: LMModel,
-    vocab: Vec<Event>,
-    inst_tokens: Option<String>,
-    max_gen_len: usize,
-    sampling: bool,
-    temperature: f64,
-    top_k: usize,
-    top_p: f64,
+    model: Model,
+    inst_ids: Option<Vec<u32>>,
+    opts: GenerateOptions,
 }
 
 impl RealtimeTranscriber {
-    pub fn new(
-        model: LMModel,
-        inst_names: Option<Vec<String>>,
-        max_gen_len: usize,
-        sampling: bool,
-        temperature: f64,
-        top_k: usize,
-        top_p: f64,
-    ) -> Self {
-        let vocab = build_event_vocab(1001);
-        let inst_tokens = inst_names
-            .map(|names| instrument_group_from_names(&names).unwrap_or_default());
-        Self { model, vocab, inst_tokens, max_gen_len, sampling, temperature, top_k, top_p }
+    pub fn new(model: Model, inst_ids: Option<Vec<u32>>, opts: GenerateOptions) -> Self {
+        Self { model, inst_ids, opts }
     }
 
-    /// Process one audio chunk (16 kHz mono f32) and return detected notes.
+    /// Transcribe one audio chunk (16 kHz mono f32) into notes, onsets shifted
+    /// to absolute `chunk_start_time`.
     pub fn transcribe_chunk(
-        &self,
+        &mut self,
         chunk_audio: &[f32],
         chunk_start_time: f64,
     ) -> Result<Vec<Note>, Box<dyn std::error::Error>> {
         if chunk_audio.is_empty() {
             return Ok(vec![]);
         }
+        // The model works on fixed 5-second segments; zero-pad the mic window.
+        let segment_samples = (SEGMENT_DURATION * SAMPLE_RATE as f64) as usize;
+        let mut segment = chunk_audio.to_vec();
+        segment.resize(segment_samples, 0.0);
 
-        let target_len = (CHUNK_DURATION_SECS * SAMPLE_RATE as f64) as usize;
-        let mut audio_buf = chunk_audio.to_vec();
-        audio_buf.resize(target_len, 0.0);
+        let prefix = self.model.build_prefix(&[segment], self.inst_ids.as_deref())?;
+        let rows = self.model.generate(&prefix, &self.opts, |_| Ok(()))?;
+        let tokens = rows.into_iter().next().unwrap_or_default();
 
-        let raw_mel = self.model.mel().compute(&audio_buf);
-        let log_mel = self.model.mel().log_mel(&raw_mel, 1e-6);
-        let t_frames = log_mel.len();
-        let mel_flat: Vec<f32> = log_mel.into_iter().flatten().collect();
-        let mel_t = candle_core::Tensor::from_vec(
-            mel_flat, (1, t_frames, 512), &self.model.device,
-        )?;
-        let inst_t = self.model.ic.tokenize(
-            &[self.inst_tokens.as_ref().map(|s| {
-                s.split_whitespace()
-                    .filter_map(|v| v.parse::<i64>().ok())
-                    .collect()
-            })],
-            &self.model.device,
-        )?;
-        let ds_t = self
-            .model
-            .dc
-            .tokenize(&[None], &self.model.device)?;
+        // Decode this single chunk in isolation.
+        let mut decoder = tokenizer::TokenDecoder::new(FRAME_RATE);
+        let mut events = Vec::new();
+        decoder.start_chunk(0.0, None, &mut events);
+        for tok in tokens {
+            decoder.push(tok, &mut events);
+        }
+        decoder.finish(&mut events);
+        let notes = tokenizer::events_to_notes(&events);
 
-        let tokens = self.model.generate(
-            &mel_t, &inst_t, &ds_t,
-            self.max_gen_len, self.sampling, self.temperature,
-            self.top_k, self.top_p,
-            &[],
-        )?;
-
-        let events = decode_tokens(&tokens, &self.vocab, chunk_start_time, None);
-        let notes = events_to_notes(&events);
-
-        let window_end = chunk_start_time + CHUNK_DURATION_SECS;
+        // Keep onsets inside the fresh (non-overlapped) part of the window and
+        // shift to absolute time.
+        let keep_from = if chunk_start_time > 0.0 { CHUNK_DURATION_SECS - OVERLAP_SECS } else { 0.0 };
         Ok(notes
             .into_iter()
-            .filter(|n| n.onset >= chunk_start_time && n.onset < window_end)
+            .filter(|n| n.onset >= keep_from && n.onset < CHUNK_DURATION_SECS)
+            .map(|mut n| {
+                let shift = chunk_start_time - keep_from;
+                n.onset += shift;
+                n.offset += shift;
+                n
+            })
             .collect())
     }
+}
+
+/// Entry point for `--mic`: capture from the default input device and print
+/// notes as they are detected.
+pub fn run_realtime(
+    model: Model,
+    inst_ids: Option<Vec<u32>>,
+    opts: GenerateOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut transcriber = RealtimeTranscriber::new(model, inst_ids, opts);
+
+    log::info!("Starting realtime mic capture...");
+    let (_stream, rx) = start_mic_capture()?;
+    println!("🎤 Listening... play music! (start_time\\tpitch\\tduration\\tprogram)");
+    for (chunk_audio, start_time) in rx {
+        match transcriber.transcribe_chunk(&chunk_audio, start_time) {
+            Ok(notes) => {
+                for n in &notes {
+                    println!("{:.3}\t{}\t{:.3}\t{}", n.onset, n.pitch, n.offset - n.onset, n.program);
+                }
+                std::io::stdout().flush().ok();
+            }
+            Err(e) => eprintln!("Transcription error: {e}"),
+        }
+    }
+    Ok(())
 }
 
 /// Start microphone capture. Returns a receiver yielding (audio_chunk, start_time).
@@ -111,9 +111,13 @@ pub fn start_mic_capture(
         .ok_or("No input device available")?;
     let config = input_device.default_input_config()?;
     let channels = config.channels() as usize;
+    let device_sr = config.sample_rate().0;
 
+    // The ring buffer holds mono samples at the device's native rate; chunks
+    // are resampled to 16 kHz before being sent to the model.
+    let capacity = device_sr as usize * 30;
     let ring: Arc<Mutex<VecDeque<f32>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(BUFFER_CAPACITY)));
+        Arc::new(Mutex::new(VecDeque::with_capacity(capacity)));
     let ring_clone = ring.clone();
     let err_fn = |err| eprintln!("Audio stream error: {err}");
 
@@ -124,14 +128,14 @@ pub fn start_mic_capture(
             if channels > 1 {
                 for ch in data.chunks(channels) {
                     let mono: f32 = ch.iter().sum::<f32>() / channels as f32;
-                    if buf.len() >= BUFFER_CAPACITY {
+                    if buf.len() >= capacity {
                         buf.pop_front();
                     }
                     buf.push_back(mono);
                 }
             } else {
                 for &s in data {
-                    if buf.len() >= BUFFER_CAPACITY {
+                    if buf.len() >= capacity {
                         buf.pop_front();
                     }
                     buf.push_back(s);
@@ -143,8 +147,7 @@ pub fn start_mic_capture(
     )?;
 
     let (tx, rx): (Sender<(Vec<f32>, f64)>, _) = bounded(10);
-    let chunk_samples = (CHUNK_DURATION_SECS * SAMPLE_RATE as f64) as usize;
-    let hop_samples = ((CHUNK_DURATION_SECS - OVERLAP_SECS) * SAMPLE_RATE as f64) as usize;
+    let chunk_samples = (CHUNK_DURATION_SECS * device_sr as f64) as usize;
 
     thread::spawn(move || {
         let mut last_time = 0.0f64;
@@ -164,9 +167,11 @@ pub fn start_mic_capture(
                 }
             };
             if filled > 0 {
+                // Resample the native-rate window to the model's 16 kHz.
+                let chunk16 = crate::audio::resample(&read_buf, device_sr, SAMPLE_RATE as u32);
                 let t = last_time;
-                last_time += hop_samples as f64 / SAMPLE_RATE as f64;
-                if tx.send((read_buf, t)).is_err() {
+                last_time += CHUNK_DURATION_SECS - OVERLAP_SECS;
+                if tx.send((chunk16, t)).is_err() {
                     break;
                 }
             }

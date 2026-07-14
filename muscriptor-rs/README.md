@@ -2,6 +2,13 @@
 
 Audio-to-MIDI transcription using a transformer language model (Rust port, built on [candle](https://github.com/huggingface/candle)).
 
+The model, mel front-end and MT3 token decoder are adapted from the
+reference-grade candle implementation ([huggingface/candle#3738](https://github.com/huggingface/candle/pull/3738)):
+the mel window/filterbank are loaded from the checkpoint buffers so the output
+matches the PyTorch reference, a preallocated KV cache and fused attention keep
+decoding fast, and chunks are batched per forward pass. This crate adds a
+standalone CLI, HuggingFace weight download, and a real-time microphone mode.
+
 ## Building
 
 The GPU backend is selected at compile time via cargo features. Pick the one

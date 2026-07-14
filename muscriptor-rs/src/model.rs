@@ -1,559 +1,538 @@
-use std::collections::HashMap;
-use std::path::Path;
+//! MuScriptor: audio-to-MIDI music transcription.
+//!
+//! A decoder-only causal transformer (audiocraft/MusicGen lineage): the audio is
+//! encoded as a log-mel spectrogram, projected to the model dimension and
+//! prepended as prefix tokens together with two class-conditioning embeddings
+//! (instrument group, dataset), after which MIDI event tokens are generated
+//! autoregressively over a single stream.
+//!
+//! Weights: hf.co/MuScriptor/muscriptor-{small,medium,large} (CC BY-NC 4.0).
 
-use candle_core::{Device, Result, Tensor, DType, safetensors};
-use candle_nn::{Module, VarBuilder};
+use crate::mel;
+use crate::sampling::{LogitsProcessor, Sampling};
+use crate::tokenizer;
+use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_nn::kv_cache::KvCache;
+use candle_nn::{layer_norm, linear, linear_no_bias, Embedding, LayerNorm, Linear, VarBuilder};
 
-use crate::config::ModelConfig;
+pub const SAMPLE_RATE: usize = 16000;
+pub const SEGMENT_DURATION: f64 = 5.0;
+pub const FRAME_RATE: usize = 100;
+const N_FFT: usize = 2048;
+const N_MELS: usize = 512;
+const MEL_EPS: f32 = 1e-6;
+const MAX_PERIOD: f32 = 10000.;
+const LN_EPS: f64 = 1e-5;
 
-// ---------------------------------------------------------------------------
-// Sinusoidal positional embeddings
-// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Config {
+    pub dim: usize,
+    pub num_heads: usize,
+    pub num_layers: usize,
+    pub card: usize,
+}
 
-fn sin_embedding(pos: &Tensor, dim: usize, max_period: f64) -> Result<Tensor> {
+impl Config {
+    pub fn small() -> Self {
+        Self {
+            dim: 768,
+            num_heads: 12,
+            num_layers: 14,
+            card: 1393,
+        }
+    }
+
+    pub fn medium() -> Self {
+        Self {
+            dim: 1024,
+            num_heads: 16,
+            num_layers: 24,
+            card: 1395,
+        }
+    }
+
+    pub fn large() -> Self {
+        Self {
+            dim: 1536,
+            num_heads: 24,
+            num_layers: 48,
+            card: 1395,
+        }
+    }
+}
+
+/// `positions.cos() ++ positions.sin()` sinusoidal embedding, computed in f32.
+/// Matches the reference `create_sin_embedding`: the exponent denominator is
+/// `half_dim - 1` (not the usual `half_dim`).
+fn sin_embedding(offset: usize, t: usize, dim: usize, device: &Device) -> Result<Tensor> {
     let half = dim / 2;
-    let device = pos.device();
-    let dtype = pos.dtype();
-    // arange(0, half) -> [1, 1, half]
-    let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
-    let adim = Tensor::from_vec(arange, (1, 1, half), device)?.to_dtype(dtype)?;
-    let log_mt = Tensor::new((max_period as f32).ln(), device)?.to_dtype(dtype)?;
-    let hf = (half as f32) - 1.0f32;
-    let adim_ratio = adim.broadcast_div(&Tensor::new(hf, device)?.to_dtype(dtype)?)?;
-    let divisor = adim_ratio.broadcast_mul(&log_mt)?.exp()?;
-    let phase = pos.broadcast_div(&divisor)?;
-    Tensor::cat(&[&phase.cos()?, &phase.sin()?], 2)
-}
-
-// ---------------------------------------------------------------------------
-// ScaledEmbedding wrapper
-// ---------------------------------------------------------------------------
-
-struct ScaledEmb {
-    inner: candle_nn::Embedding,
-}
-
-impl ScaledEmb {
-    fn new(vs: usize, d: usize, vb: &VarBuilder) -> Result<Self> {
-        let w = vb.get((vs, d), "weight")?;
-        Ok(Self { inner: candle_nn::Embedding::new(w, d) })
+    let mut data = vec![0f32; t * dim];
+    for pos_idx in 0..t {
+        let pos = (offset + pos_idx) as f32;
+        for i in 0..half {
+            let period = MAX_PERIOD.powf(i as f32 / (half - 1) as f32);
+            let phase = pos / period;
+            data[pos_idx * dim + i] = phase.cos();
+            data[pos_idx * dim + half + i] = phase.sin();
+        }
     }
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let neg = x.lt(0)?.unsqueeze(2)?.to_dtype(DType::F32)?;
-        let emb = self.inner.forward(&x.clamp(0, i64::MAX)?)?;
-        // Zero out positions where input was negative
-        let ones = Tensor::new(1.0f32, x.device())?.to_dtype(emb.dtype())?;
-        emb.broadcast_mul(&(ones.broadcast_sub(&neg))?)
-    }
+    Tensor::from_vec(data, (t, dim), device)
 }
 
-// ---------------------------------------------------------------------------
-// Multi-head attention with KV cache
-// ---------------------------------------------------------------------------
-
-struct Attn {
-    dh: usize,
-    nh: usize,
-    in_w: Tensor,
-    out_w: Tensor,
+/// LayerNorm that dispatches to the fused kernel on Metal (a single launch
+/// instead of the decomposed mean/variance op chain, which dominates decode
+/// time at batch 1-4) and to the standard module elsewhere.
+#[derive(Debug, Clone)]
+struct Norm {
+    inner: LayerNorm,
+    fused: bool,
 }
 
-impl Attn {
-    fn new(d: usize, nh: usize, vb: &VarBuilder) -> Result<Self> {
-        let three_d = 3usize * d;
+impl Norm {
+    fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+        let fused = vb.device().is_metal();
         Ok(Self {
-            dh: d / nh, nh,
-            in_w: vb.get((three_d, d), "in_proj_weight")?,
-            out_w: vb.get((d, d), "out_proj.weight")?,
+            inner: layer_norm(dim, LN_EPS, vb)?,
+            fused,
         })
     }
 
-    fn forward(
-        &self, x: &Tensor,
-        kc: &mut Option<Tensor>, vc: &mut Option<Tensor>,
-        off: &mut usize,
-    ) -> Result<Tensor> {
-        let dev = x.device();
-        let dt = x.dtype();
-        let (b, t, d) = x.dims3()?;
-        let nh = self.nh;
-        let dh = self.dh;
-
-        let p = matmul_3d(x, &self.in_w.t()?)?.reshape((b, t, 3usize, nh, dh))?;
-        let q = p.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
-        let k = p.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
-        let v = p.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
-
-        let (k, v) = if let (Some(kk), Some(vv)) = (kc.as_ref(), vc.as_ref()) {
-            // The cache holds exactly *off timesteps, so append the new
-            // key/value directly instead of narrowing (which copied the whole
-            // cache an extra time every step).
-            let kf = Tensor::cat(&[kk, &k], 2)?;
-            let vf = Tensor::cat(&[vv, &v], 2)?;
-            *kc = Some(kf.clone());
-            *vc = Some(vf.clone());
-            (kf, vf)
-        } else {
-            *kc = Some(k.clone());
-            *vc = Some(v.clone());
-            (k, v)
-        };
-        *off += t;
-
-        let tq = q.dim(2)?;
-        let tk = k.dim(2)?;
-        let scale = (dh as f64).powf(-0.5);
-        let mut a = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
-
-        // The causal mask only matters when queries and keys span the same
-        // window (the prefill). During incremental decoding tq == 1, so every
-        // cached key is visible and the mask is all-ones — skip building it.
-        if tq == tk && tq > 1 {
-            // Additive causal bias: 0.0 for visible positions, -inf for masked.
-            // (The previous `(1-mask) * -inf` form produced 0*-inf = NaN at every
-            // *visible* position, poisoning the whole forward pass with NaN.)
-            let mut bias: Vec<f32> = Vec::with_capacity(tq * tk);
-            for i in 0..tq {
-                for j in 0..tk {
-                    bias.push(if j <= i + tk - tq { 0.0 } else { f32::NEG_INFINITY });
-                }
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match (self.fused, self.inner.bias()) {
+            (true, Some(bias)) => {
+                candle_nn::ops::layer_norm(xs, self.inner.weight(), bias, LN_EPS as f32)
             }
-            let bias = Tensor::from_vec(bias, (tq, tk), dev)?.to_dtype(dt)?;
-            a = a.broadcast_add(&bias)?;
-        }
-
-        let a = candle_nn::ops::softmax(&a, 3)?;
-        let o = a.matmul(&v)?;
-        let o = o.transpose(1, 2)?.reshape((b, tq, nh * dh))?;
-        matmul_3d(&o, &self.out_w.t()?)
-    }
-}
-
-fn matmul_3d(x: &Tensor, wt: &Tensor) -> Result<Tensor> {
-    let nd = x.dims().len();
-    if nd <= 2 {
-        x.matmul(wt)
-    } else {
-        let (b, t, d) = x.dims3()?;
-        let x2 = x.reshape((b * t, d))?;
-        let y2 = x2.matmul(wt)?;
-        y2.reshape((b, t, wt.dim(1)?))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Linear (no bias) helper
-// ---------------------------------------------------------------------------
-
-struct LinNB { w: Tensor }
-impl LinNB {
-    fn new(in_dim: usize, out_dim: usize, vb: &VarBuilder, name: &str) -> Result<Self> {
-        let w = vb.get((out_dim, in_dim), &format!("{}.weight", name))?;
-        Ok(Self { w })
-    }
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let wt = self.w.t()?;
-        let nd = x.dims().len();
-        if nd <= 2 {
-            x.matmul(&wt)
-        } else {
-            let (b, t, d) = x.dims3()?;
-            let x2 = x.reshape((b * t, d))?;
-            let y2 = x2.matmul(&wt)?;
-            y2.reshape((b, t, wt.dim(1)?))
+            _ => self.inner.forward(xs),
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Linear with bias helper
-// ---------------------------------------------------------------------------
-
-struct LinB { w: Tensor, b: Tensor }
-impl LinB {
-    fn new(in_dim: usize, out_dim: usize, vb: &VarBuilder, name: &str) -> Result<Self> {
-        let w = vb.get((out_dim, in_dim), &format!("{}.weight", name))?;
-        let b = vb.get(out_dim, &format!("{}.bias", name))?;
-        Ok(Self { w, b })
-    }
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = matmul_3d(x, &self.w.t()?)?;
-        y.broadcast_add(&self.b)
-    }
+#[derive(Debug, Clone)]
+struct StreamingMultiheadAttention {
+    in_proj: Linear,
+    out_proj: Linear,
+    kv_cache: KvCache,
+    num_heads: usize,
+    head_dim: usize,
 }
 
-// ---------------------------------------------------------------------------
-// LayerNorm helper (manual implementation)
-// ---------------------------------------------------------------------------
-
-struct LN { w: Tensor, b: Tensor, eps: f64 }
-impl LN {
-    fn new(dim: usize, eps: f64, vb: &VarBuilder, name: &str) -> Result<Self> {
-        let w = vb.get(dim, &format!("{}.weight", name))?;
-        let b = vb.get(dim, &format!("{}.bias", name))?;
-        Ok(Self { w, b, eps })
-    }
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mean = x.mean_keepdim(2)?;
-        let x_center = x.broadcast_sub(&mean)?;
-        let var = x_center.sqr()?.mean_keepdim(2)?;
-        let eps_t = Tensor::new(self.eps as f32, var.device())?;
-        let denom = (var.broadcast_add(&eps_t))?.sqrt()?;
-        let x_norm = x_center.broadcast_div(&denom)?;
-        x_norm.broadcast_mul(&self.w.unsqueeze(0)?)?
-            .broadcast_add(&self.b.unsqueeze(0)?)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Transformer Layer
-// ---------------------------------------------------------------------------
-
-struct TLayer {
-    attn: Attn,
-    n1: LN, n2: LN,
-    l1: LinNB, l2: LinNB,
-}
-
-impl TLayer {
-    fn new(d: usize, nh: usize, ff: usize, vb: &VarBuilder, prefix: &str) -> Result<Self> {
+impl StreamingMultiheadAttention {
+    fn new(dim: usize, num_heads: usize, vb: VarBuilder) -> Result<Self> {
+        let in_proj_weight = vb.get((3 * dim, dim), "in_proj_weight")?;
+        let in_proj = Linear::new(in_proj_weight, None);
+        let out_proj = linear_no_bias(dim, dim, vb.pp("out_proj"))?;
         Ok(Self {
-            attn: Attn::new(d, nh, &vb.pp(&format!("{}.self_attn", prefix)))?,
-            n1: LN::new(d, 1e-5, vb, &format!("{}.norm1", prefix))?,
-            n2: LN::new(d, 1e-5, vb, &format!("{}.norm2", prefix))?,
-            l1: LinNB::new(d, ff, vb, &format!("{}.linear1", prefix))?,
-            l2: LinNB::new(ff, d, vb, &format!("{}.linear2", prefix))?,
+            in_proj,
+            out_proj,
+            kv_cache: KvCache::new(2, 128),
+            num_heads,
+            head_dim: dim / num_heads,
         })
     }
-    fn forward(&self, x: &Tensor, kc: &mut Option<Tensor>, vc: &mut Option<Tensor>, off: &mut usize) -> Result<Tensor> {
-        let r = x;
-        let x = self.n1.forward(x)?;
-        let x = self.attn.forward(&x, kc, vc, off)?;
-        let x = (x + r)?;
-        let r = &x;
-        let x = self.n2.forward(&x)?;
-        let x = self.l2.forward(&self.l1.forward(&x)?.gelu_erf()?)?;
-        Ok((x + r)?)
+
+    fn reset_state(&mut self, max_seq_len: usize) {
+        self.kv_cache = KvCache::new(2, max_seq_len);
+    }
+
+    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let (b, t, dim) = xs.dims3()?;
+        // The fused projection packs (q, k, v) along the outer dimension.
+        let qkv = xs
+            .apply(&self.in_proj)?
+            .reshape((b, t, 3, self.num_heads, self.head_dim))?;
+        let q = qkv.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?;
+        let k = qkv.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?;
+        let v = qkv.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?;
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+
+        let scale = 1f64 / (self.head_dim as f64).sqrt();
+        let attn = if xs.device().is_metal() {
+            // Fused kernels; they read the KV cache's narrowed views through
+            // their strides directly. Prefill always starts from an empty
+            // cache (q_len == k_len), so plain causal alignment is correct;
+            // a single decode step attends to the whole cache.
+            candle_nn::ops::sdpa(&q.contiguous()?, &k, &v, None, t > 1, scale as f32, 1.0)?
+        } else {
+            let attn = (q.contiguous()?.matmul(&k.transpose(2, 3)?)? * scale)?;
+            let attn = match mask {
+                None => attn,
+                Some(mask) => attn.broadcast_add(mask)?,
+            };
+            // Softmax in f32 as torch's SDPA does for half-precision inputs.
+            let dtype = attn.dtype();
+            let attn = if dtype == DType::F32 {
+                candle_nn::ops::softmax_last_dim(&attn)?
+            } else {
+                let attn = attn.to_dtype(DType::F32)?;
+                candle_nn::ops::softmax_last_dim(&attn)?.to_dtype(dtype)?
+            };
+            attn.matmul(&v.contiguous()?)?
+        };
+        attn.transpose(1, 2)?
+            .reshape((b, t, dim))?
+            .apply(&self.out_proj)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transformer
-// ---------------------------------------------------------------------------
-
-struct TF {
-    layers: Vec<TLayer>,
-    max_period: f64,
-    dim: usize,
+#[derive(Debug, Clone)]
+struct StreamingTransformerLayer {
+    self_attn: StreamingMultiheadAttention,
+    norm1: Norm,
+    norm2: Norm,
+    linear1: Linear,
+    linear2: Linear,
 }
 
-impl TF {
-    fn new(cfg: &ModelConfig, vb: &VarBuilder) -> Result<Self> {
+impl StreamingTransformerLayer {
+    fn new(dim: usize, num_heads: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            self_attn: StreamingMultiheadAttention::new(dim, num_heads, vb.pp("self_attn"))?,
+            norm1: Norm::new(dim, vb.pp("norm1"))?,
+            norm2: Norm::new(dim, vb.pp("norm2"))?,
+            linear1: linear_no_bias(dim, hidden, vb.pp("linear1"))?,
+            linear2: linear_no_bias(hidden, dim, vb.pp("linear2"))?,
+        })
+    }
+
+    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let xs = (xs + self.self_attn.forward(&self.norm1.forward(xs)?, mask)?)?;
+        let ff = self
+            .norm2
+            .forward(&xs)?
+            .apply(&self.linear1)?
+            // torch's F.gelu defaults to the exact erf formulation.
+            .gelu_erf()?
+            .apply(&self.linear2)?;
+        xs + ff
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StreamingTransformer {
+    layers: Vec<StreamingTransformerLayer>,
+    offset: usize,
+}
+
+impl StreamingTransformer {
+    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let vb_l = vb.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            layers.push(TLayer::new(cfg.dim, cfg.num_heads, cfg.dim_feedforward(), vb, &format!("layers.{}", i))?);
+            layers.push(StreamingTransformerLayer::new(
+                cfg.dim,
+                cfg.num_heads,
+                4 * cfg.dim,
+                vb_l.pp(i),
+            )?)
         }
-        Ok(Self { layers, max_period: cfg.max_period, dim: cfg.dim })
+        Ok(Self { layers, offset: 0 })
     }
 
-    fn forward(&self, x: &Tensor, offs: &[usize], kcs: &mut [Option<Tensor>], vcs: &mut [Option<Tensor>], los: &mut [usize]) -> Result<Tensor> {
-        let (_b, t, d) = x.dims3()?;
-        let dev = x.device();
-        let dt = x.dtype();
-        // Positions are the same for every batch row, so build [1, t, 1] and let
-        // the add broadcast over the batch. (`offs` carries the current cache
-        // offset in offs[0].)
-        let base = offs.first().copied().unwrap_or(0);
-        let pos: Vec<f32> = (0..t).map(|ti| (base + ti) as f32).collect();
-        let pt = Tensor::from_vec(pos, (1, t, 1), dev)?.to_dtype(dt)?;
-        let mut h = x.broadcast_add(&sin_embedding(&pt, d, self.max_period)?)?;
-        for (i, l) in self.layers.iter().enumerate() {
-            h = l.forward(&h, &mut kcs[i], &mut vcs[i], &mut los[i])?;
+    fn reset_state(&mut self, max_seq_len: usize) {
+        self.offset = 0;
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.reset_state(max_seq_len)
         }
-        Ok(h)
     }
-}
 
-// ---------------------------------------------------------------------------
-// Conditioners
-// ---------------------------------------------------------------------------
-
-struct MelC { proj: LinB, dim: usize, mel: crate::mel::MelSpectrogram }
-impl MelC {
-    fn new(od: usize, vb: &VarBuilder) -> Result<Self> {
-        // Load the Hann window and HTK filterbank straight from the checkpoint
-        // buffers so the mel front-end matches the reference bit-for-bit.
-        let window = vb.get(2048, "mel_spec_transform.spectrogram.window")?
-            .to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        let fb = vb.get((1025, 512), "mel_spec_transform.mel_scale.fb")?
-            .to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-        let mel = crate::mel::MelSpectrogram::new(2048, 160, 512, window, fb);
-        Ok(Self { proj: LinB::new(512, od, vb, "output_proj")?, dim: od, mel })
-    }
-    fn forward(&self, m: &Tensor) -> Result<(Tensor, Tensor)> {
-        let nd = m.dims().len();
-        let e = if nd == 3 {
-            let (b, t, _) = m.dims3()?;
-            let flat = m.reshape((b * t, 512))?;
-            self.proj.forward(&flat)?.reshape((b, t, self.dim))?
+    fn forward(&mut self, xs: &Tensor) -> Result<Tensor> {
+        let (_b, t, dim) = xs.dims3()?;
+        let pos_emb = sin_embedding(self.offset, t, dim, xs.device())?.to_dtype(xs.dtype())?;
+        let mut xs = xs.broadcast_add(&pos_emb)?;
+        let mask = if t <= 1 || xs.device().is_metal() {
+            // A single decode step attends to the whole cache, and the fused
+            // Metal attention applies causality itself: no mask needed.
+            None
         } else {
-            self.proj.forward(m)?
+            let offset = self.offset;
+            let s = offset + t;
+            let mask: Vec<f32> = (0..t)
+                .flat_map(|i| {
+                    (0..s).map(move |j| {
+                        if j <= offset + i {
+                            0.
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                })
+                .collect();
+            Some(Tensor::from_vec(mask, (t, s), xs.device())?.to_dtype(xs.dtype())?)
         };
-        let mask = Tensor::ones(e.dims(), e.dtype(), e.device())?;
-        Ok((e, mask))
-    }
-}
-
-pub struct ClsC {
-    pub emb: candle_nn::Embedding,
-}
-impl ClsC {
-    fn new(nc: usize, d: usize, vb: &VarBuilder, name: &str) -> Result<Self> {
-        let w = vb.get((nc + 1, d), &format!("{}.weight", name))?;
-        Ok(Self { emb: candle_nn::Embedding::new(w, d) })
-    }
-    pub fn tokenize(&self, inp: &[Option<Vec<i64>>], dev: &Device) -> Result<Tensor> {
-        let b = inp.len();
-        let ml = inp.iter().map(|c| c.as_ref().map_or(0, |v| v.len())).max().unwrap_or(1).max(1);
-        let mut data = Vec::with_capacity(b * ml);
-        for c in inp {
-            match c {
-                // Reference offsets class ids by +2 (tokenizer +1, forward +1),
-                // so raw class `c` lands on embedding row `c+2` and the null
-                // (unconditional) class lands on row 1.
-                Some(v) => {
-                    for &x in v { data.push(x + 2); }
-                    data.resize(data.len() + (ml - v.len()), 1i64);
-                }
-                None => { data.resize(data.len() + ml, 1i64); }
-            }
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, mask.as_ref())?
         }
-        Tensor::from_vec(data, (b, ml), dev)
-    }
-    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let e = self.emb.forward(x)?;
-        let mask = Tensor::ones(e.dims(), e.dtype(), e.device())?;
-        Ok((e, mask))
+        self.offset += t;
+        Ok(xs)
     }
 }
 
-// ---------------------------------------------------------------------------
-// LMModel
-// ---------------------------------------------------------------------------
-
-pub struct LMModel {
-    emb: ScaledEmb,
-    tf: TF,
-    on: LN,
-    lin: LinNB,
-    mc: MelC,
-    pub ic: ClsC,
-    pub dc: ClsC,
-    pub card: usize,
-    pub dim: usize,
-    pub device: Device,
+/// Log-mel-spectrogram conditioner: mel bins are computed on the host in f32
+/// and projected to the transformer dimension.
+#[derive(Debug, Clone)]
+pub struct MelConditioner {
+    mel: mel::MelSpectrogram,
+    output_proj: Linear,
+    device: Device,
 }
 
-impl LMModel {
-    pub fn load<P: AsRef<Path>>(path: P, cfg: &ModelConfig, device: &Device) -> Result<Self> {
-        // safetensors::load in candle 0.10 takes a path directly
-        let tensors_map = safetensors::load(path.as_ref(), device)?;
-        let mut tensors = HashMap::new();
-        for (k, v) in &tensors_map {
-            let nk = k.replacen("emb.0.", "emb.", 1).replacen("linears.0.", "linear.", 1);
-            log::debug!("  tensor {} -> {}", k, nk);
-            tensors.insert(nk, v.clone());
-        }
-        log::info!("Loaded {} tensors", tensors.len());
-        for (k, _) in &tensors {
-            log::debug!("  available: {}", k);
-        }
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
-        let mut m = Self::new(&vb, cfg)?;
-        m.device = device.clone();
-        Ok(m)
-    }
-
-    /// The mel front-end, with window/filterbank loaded from the checkpoint.
-    pub fn mel(&self) -> &crate::mel::MelSpectrogram { &self.mc.mel }
-
-    pub fn new(vb: &VarBuilder, cfg: &ModelConfig) -> Result<Self> {
+impl MelConditioner {
+    fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+        let vb_t = vb.pp("mel_spec_transform");
+        let window = vb_t
+            .get(N_FFT, "spectrogram.window")?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<f32>()?;
+        let fb = vb_t
+            .get((N_FFT / 2 + 1, N_MELS), "mel_scale.fb")?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let hop = SAMPLE_RATE / FRAME_RATE;
         Ok(Self {
-            emb: ScaledEmb::new(cfg.card + 1, cfg.dim, &vb.pp("emb"))?,
-            tf: TF::new(cfg, &vb.pp("transformer"))?,
-            on: LN::new(cfg.dim, 1e-5, vb, "out_norm")?,
-            lin: LinNB::new(cfg.dim, cfg.card, vb, "linear")?,
-            mc: MelC::new(cfg.dim, &vb.pp("condition_provider.conditioners.self_wav"))?,
-            ic: ClsC::new(1000, cfg.dim, &vb.pp("condition_provider.conditioners.instrument_group"), "embed")?,
-            dc: ClsC::new(4, cfg.dim, &vb.pp("condition_provider.conditioners.dataset_name"), "embed")?,
-            card: cfg.card, dim: cfg.dim,
-            device: Device::Cpu,
+            mel: mel::MelSpectrogram::new(N_FFT, hop, N_MELS, window, fb),
+            output_proj: linear(N_MELS, dim, vb.pp("output_proj"))?,
+            device: vb.device().clone(),
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self, seq: &Tensor, mel: &Tensor, inst: &Tensor, ds: &Tensor,
-        first: bool, kcs: &mut [Option<Tensor>], vcs: &mut [Option<Tensor>], los: &mut [usize],
+    /// Encode one fixed-size audio segment into `[1, n_frames, dim]` (f32).
+    pub fn encode(&self, samples: &[f32]) -> Result<Tensor> {
+        let (mel, n_frames) = self.mel.compute(samples);
+        let mel = mel.iter().map(|&v| (v + MEL_EPS).ln()).collect::<Vec<_>>();
+        let mel = Tensor::from_vec(mel, (1, n_frames, N_MELS), &self.device)?;
+        let embeds = mel.apply(&self.output_proj)?;
+        // The reference masks frames at index >= len(samples) / hop; with
+        // center-padded STFT there are len/hop + 1 frames, so the final frame
+        // is always zeroed.
+        let valid = samples.len() / self.mel.hop_length();
+        if valid < n_frames {
+            let zeros = Tensor::zeros(
+                (1, n_frames - valid, embeds.dim(2)?),
+                embeds.dtype(),
+                embeds.device(),
+            )?;
+            Tensor::cat(&[embeds.narrow(1, 0, valid)?, zeros], 1)
+        } else {
+            Ok(embeds)
+        }
+    }
+}
+
+/// Class-index conditioner (instrument group / dataset name).
+#[derive(Debug, Clone)]
+pub struct ClassConditioner {
+    embed: Embedding,
+    device: Device,
+}
+
+impl ClassConditioner {
+    fn new(num_classes: usize, dim: usize, vb: VarBuilder) -> Result<Self> {
+        let embed = candle_nn::embedding(num_classes + 1, dim, vb.pp("embed"))?;
+        Ok(Self {
+            embed,
+            device: vb.device().clone(),
+        })
+    }
+
+    /// Encode a class-id sequence into `[1, len, dim]` (f32). `None` is the
+    /// null (unconditional) condition. The reference tokenizer adds 1 to the
+    /// raw ids (null = -1) and its forward pass adds 1 again, so class `c`
+    /// lands on embedding row `c + 2` and null on row 1.
+    pub fn encode(&self, classes: Option<&[u32]>) -> Result<Tensor> {
+        let ids = match classes {
+            None => vec![1u32],
+            Some(cs) => cs.iter().map(|c| c + 2).collect(),
+        };
+        let len = ids.len();
+        let ids = Tensor::from_vec(ids, (1, len), &self.device)?;
+        self.embed.forward(&ids)
+    }
+}
+
+fn get_with_legacy_prefix(
+    vb: &VarBuilder,
+    shape: (usize, usize),
+    name: &str,
+    legacy: &str,
+) -> Result<Tensor> {
+    // Published checkpoints keep the audiocraft multi-codebook naming for the
+    // token embedding and output head (`emb.0.*` / `linears.0.*`).
+    if vb.contains_tensor(legacy) {
+        vb.get(shape, legacy)
+    } else {
+        vb.get(shape, name)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerateOptions {
+    /// Maximum number of generated tokens per segment.
+    pub max_gen_len: usize,
+    /// `None` decodes greedily (the reference default).
+    pub sampling: Option<Sampling>,
+    pub seed: u64,
+}
+
+impl Default for GenerateOptions {
+    fn default() -> Self {
+        Self {
+            max_gen_len: 2000,
+            sampling: None,
+            seed: 299792458,
+        }
+    }
+}
+
+pub struct Model {
+    pub mel_conditioner: MelConditioner,
+    pub instrument_conditioner: ClassConditioner,
+    pub dataset_conditioner: ClassConditioner,
+    emb: Embedding,
+    transformer: StreamingTransformer,
+    out_norm: Norm,
+    linear: Linear,
+    card: usize,
+    dtype: DType,
+    device: Device,
+}
+
+impl Model {
+    /// Build the model. `vb` carries the transformer compute dtype; the
+    /// conditioners always run in f32 (`vb_f32`), matching the reference
+    /// which keeps the conditioning pipeline in full precision.
+    pub fn new(cfg: &Config, vb: VarBuilder, vb_f32: VarBuilder) -> Result<Self> {
+        let conds = vb_f32.pp("condition_provider").pp("conditioners");
+        let mel_conditioner = MelConditioner::new(cfg.dim, conds.pp("self_wav"))?;
+        let instrument_conditioner =
+            ClassConditioner::new(1000, cfg.dim, conds.pp("instrument_group"))?;
+        let dataset_conditioner = ClassConditioner::new(4, cfg.dim, conds.pp("dataset_name"))?;
+        let emb_weight =
+            get_with_legacy_prefix(&vb, (cfg.card + 1, cfg.dim), "emb.weight", "emb.0.weight")?;
+        let linear_weight = get_with_legacy_prefix(
+            &vb,
+            (cfg.card, cfg.dim),
+            "linear.weight",
+            "linears.0.weight",
+        )?;
+        Ok(Self {
+            mel_conditioner,
+            instrument_conditioner,
+            dataset_conditioner,
+            emb: Embedding::new(emb_weight, cfg.dim),
+            transformer: StreamingTransformer::new(cfg, vb.pp("transformer"))?,
+            out_norm: Norm::new(cfg.dim, vb.pp("out_norm"))?,
+            linear: Linear::new(linear_weight, None),
+            card: cfg.card,
+            dtype: vb.dtype(),
+            device: vb.device().clone(),
+        })
+    }
+
+    /// The BOS token prepended to every generated sequence.
+    pub fn initial_token_id(&self) -> u32 {
+        self.card as u32
+    }
+
+    /// The device the model runs on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Build the conditioning prefix for a batch of equally-sized audio
+    /// segments: `[mel frames, dataset, instrument group(s)]`, in the
+    /// transformer dtype, shape `[b, prefix_len, dim]`.
+    pub fn build_prefix(
+        &self,
+        segments: &[impl AsRef<[f32]>],
+        instrument_classes: Option<&[u32]>,
     ) -> Result<Tensor> {
-        let (b, s) = seq.dims2()?;
-        let mut h = self.emb.forward(seq)?;
-        let mut pl = 0;
-        if first {
-            let (mc, _) = self.mc.forward(mel)?;
-            let (ic, _) = self.ic.forward(inst)?;
-            let (dc, _) = self.dc.forward(ds)?;
-            // Prefix order must match the Python reference. There the
-            // condition dict is {instrument, dataset, self_wav} but each is
-            // cat'd to the *front*, so the final prefix is the reverse:
-            // [mel, dataset, instrument, tokens].
-            h = Tensor::cat(&[&mc, &dc, &ic, &h], 1)?;
-            pl = h.dim(1)? - s;
-        }
-        // Absolute position of the tokens being processed = number of
-        // timesteps already in the KV cache (0 during the prefill). Using a
-        // hardcoded 0 here gave every incrementally-decoded token the
-        // position-0 sinusoidal embedding, corrupting generation.
-        let cur = los.first().copied().unwrap_or(0);
-        let offs = &[cur];
-        h = self.tf.forward(&h, offs, kcs, vcs, los)?;
-        h = if pl > 0 { self.on.forward(&h.narrow(1, pl, s)?)? } else { self.on.forward(&h)? };
-        self.lin.forward(&h)
+        let mels = segments
+            .iter()
+            .map(|s| self.mel_conditioner.encode(s.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        let mel = Tensor::cat(&mels, 0)?;
+        let b = segments.len();
+        // Datasets are always conditioned on the null class at inference.
+        let dataset = self
+            .dataset_conditioner
+            .encode(None)?
+            .expand((b, 1, mel.dim(2)?))?;
+        let instrument = self.instrument_conditioner.encode(instrument_classes)?;
+        let instrument = instrument.expand((b, instrument.dim(1)?, mel.dim(2)?))?;
+        // The reference prepends conditions in front of the tokens one at a
+        // time (instrument, then dataset, then mel), which yields this order.
+        Tensor::cat(&[mel, dataset, instrument], 1)?.to_dtype(self.dtype)
     }
 
-    /// Pick the next token from last-position logits (greedy or sampling).
-    fn pick(&self, logits: &Tensor, sample: bool, temp: f64, dev: &Device) -> Result<i64> {
-        if sample && temp > 0.0 {
-            let temp_t = Tensor::new(temp as f32, dev)?;
-            let probs = candle_nn::ops::softmax(&(logits / temp_t)?, 1)?;
-            sample_token(&probs, dev)?.to_scalar::<i64>()
-        } else {
-            logits.argmax(1)?.squeeze(0)?.to_dtype(DType::I64)?.to_scalar::<i64>()
-        }
+    /// One forward pass over embedded inputs; returns the last position's
+    /// logits over the usable vocabulary, in f32, shape `[b, vocab]`.
+    fn forward_embeds(&mut self, xs: &Tensor) -> Result<Tensor> {
+        let t = xs.dim(1)?;
+        let out = self.transformer.forward(xs)?;
+        // contiguous: the fused layer-norm kernel requires it, and narrowing
+        // the time axis leaves a strided view when b > 1.
+        let out = out.narrow(1, t - 1, 1)?.contiguous()?;
+        let logits = self.out_norm.forward(&out)?.apply(&self.linear)?;
+        // The reference sets logits at indices >= 1393 (reserved rows) to
+        // -inf; restricting the head to the usable vocabulary is equivalent.
+        let vocab = self.card.min(tokenizer::VOCAB_SIZE);
+        logits.squeeze(1)?.narrow(1, 0, vocab)?.to_dtype(DType::F32)
     }
 
-    /// Pick the next token for each row of a `[b, card]` logits tensor.
-    fn pick_batch(&self, logits: &Tensor, sample: bool, temp: f64, dev: &Device) -> Result<Vec<i64>> {
-        if sample && temp > 0.0 {
-            let temp_t = Tensor::new(temp as f32, dev)?;
-            let probs = candle_nn::ops::softmax(&(logits / temp_t)?, 1)?;
-            sample_token(&probs, dev)?.flatten_all()?.to_vec1::<i64>()
-        } else {
-            logits.argmax(1)?.to_dtype(DType::I64)?.to_vec1::<i64>()
-        }
-    }
+    /// Autoregressively generate MIDI tokens for a batch of conditioning
+    /// prefixes. `on_step` receives the batch's tokens after every step
+    /// (including EOS and post-EOS filler, exactly like the reference
+    /// streaming loop). Returns each row's tokens truncated at EOS.
+    pub fn generate(
+        &mut self,
+        prefix: &Tensor,
+        opts: &GenerateOptions,
+        mut on_step: impl FnMut(&[u32]) -> Result<()>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let (b, prefix_len, _dim) = prefix.dims3()?;
+        self.transformer
+            .reset_state(prefix_len + opts.max_gen_len + 1);
 
-    /// Generate tokens for a batch of `b` chunks at once (no prelude forcing).
-    /// The batch is stepped together until every row emits EOS or `max_len` is
-    /// reached; each returned sequence is truncated at its EOS.
-    pub fn generate_batch(
-        &self, mel: &Tensor, inst: &Tensor, ds: &Tensor,
-        max_len: usize, sample: bool, temp: f64,
-    ) -> Result<Vec<Vec<i64>>> {
-        let dev = mel.device();
-        let eos = 1i64;
-        let init = self.card as i64;
-        let b = mel.dim(0)?;
-        let nl = self.tf.layers.len();
-        let mut kcs: Vec<Option<Tensor>> = vec![None; nl];
-        let mut vcs: Vec<Option<Tensor>> = vec![None; nl];
-        let mut los: Vec<usize> = vec![0; nl];
+        let mut logits_processor = opts
+            .sampling
+            .as_ref()
+            .map(|sampling| LogitsProcessor::from_sampling(opts.seed, sampling.clone()));
 
-        let mut rows: Vec<Vec<i64>> = vec![Vec::new(); b];
+        let bos = Tensor::full(self.initial_token_id(), (b, 1), &self.device)?;
+        let bos = self.emb.forward(&bos)?;
+        let mut input = Tensor::cat(&[prefix.clone(), bos], 1)?;
+
+        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); b];
         let mut done = vec![false; b];
-
-        // Prefill one BOS per row; conditioning is prepended inside forward.
-        let seq = Tensor::from_vec(vec![init; b], (b, 1), dev)?;
-        let out = self.forward(&seq, mel, inst, ds, true, &mut kcs, &mut vcs, &mut los)?;
-        let s = out.dim(1)?;
-        let mut logits = out.narrow(1, s - 1, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
-
-        for _ in 0..max_len {
-            let toks = self.pick_batch(&logits, sample, temp, dev)?;
-            for (i, &t) in toks.iter().enumerate() {
-                if !done[i] {
-                    if t == eos { done[i] = true; } else { rows[i].push(t); }
+        for _step in 0..opts.max_gen_len {
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            let logits = self.forward_embeds(&input)?;
+            // One device→host transfer per step, not one per batch row.
+            let tokens = match logits_processor.as_mut() {
+                None => logits.argmax(D::Minus1)?.to_vec1::<u32>()?,
+                Some(lp) => {
+                    let logits = logits.to_device(&Device::Cpu)?;
+                    (0..b)
+                        .map(|row| lp.sample(&logits.narrow(0, row, 1)?.squeeze(0)?))
+                        .collect::<Result<Vec<_>>>()?
+                }
+            };
+            on_step(&tokens)?;
+            for row in 0..b {
+                if !done[row] {
+                    if tokens[row] == tokenizer::EOS_ID {
+                        done[row] = true;
+                    } else {
+                        rows[row].push(tokens[row]);
+                    }
                 }
             }
-            if done.iter().all(|&d| d) { break; }
-            let next = Tensor::from_vec(toks, (b, 1), dev)?;
-            let out = self.forward(&next, mel, inst, ds, false, &mut kcs, &mut vcs, &mut los)?;
-            logits = out.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
+            let next = Tensor::from_vec(tokens, (b, 1), &self.device)?;
+            input = self.emb.forward(&next)?;
         }
         Ok(rows)
     }
-
-    /// Autoregressively generate tokens for one chunk.
-    ///
-    /// `prompt` (may be empty) is a forced prefix — the teacher-forced tie
-    /// prologue for prelude forcing. Its tokens are prefilled verbatim right
-    /// after the initial token and included at the front of the returned
-    /// sequence (so the downstream decoder sees them), then free generation
-    /// continues until EOS or `max_len` total tokens.
-    pub fn generate(
-        &self, mel: &Tensor, inst: &Tensor, ds: &Tensor,
-        max_len: usize, sample: bool, temp: f64, _top_k: usize, _top_p: f64,
-        prompt: &[i64],
-    ) -> Result<Vec<i64>> {
-        let dev = mel.device();
-        let eos = 1i64;
-        let init = self.card as i64;
-        let nl = self.tf.layers.len();
-        let mut kcs: Vec<Option<Tensor>> = vec![None; nl];
-        let mut vcs: Vec<Option<Tensor>> = vec![None; nl];
-        let mut los: Vec<usize> = vec![0; nl];
-        let mut out: Vec<i64> = Vec::new();
-
-        // Prefill: [init] + forced prompt. forward(first=true) prepends the
-        // conditioning; the last position predicts the first free token.
-        let mut prefill = Vec::with_capacity(1 + prompt.len());
-        prefill.push(init);
-        prefill.extend_from_slice(prompt);
-        let sl = prefill.len();
-        let seq = Tensor::from_vec(prefill, (1, sl), dev)?;
-        let logits = self.forward(&seq, mel, inst, ds, true, &mut kcs, &mut vcs, &mut los)?;
-        let logits = logits.narrow(1, sl - 1, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
-
-        // The forced prompt tokens are part of the emitted sequence.
-        out.extend_from_slice(prompt);
-        if out.len() < max_len {
-            let next = self.pick(&logits, sample, temp, dev)?;
-            out.push(next);
-        }
-
-        // Incremental free generation.
-        while out.len() < max_len {
-            let last = *out.last().unwrap();
-            if last == eos { break; }
-            let seq = Tensor::from_vec(vec![last], (1, 1), dev)?;
-            let logits = self.forward(&seq, mel, inst, ds, false, &mut kcs, &mut vcs, &mut los)?;
-            let logits = logits.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
-            let next = self.pick(&logits, sample, temp, dev)?;
-            out.push(next);
-        }
-
-        if log::log_enabled!(log::Level::Debug) {
-            let n = out.len().min(60);
-            log::debug!("first {} tokens: {:?}", n, &out[..n]);
-        }
-        Ok(out)
-    }
-}
-
-fn sample_token(probs: &Tensor, dev: &Device) -> Result<Tensor> {
-    let b = probs.dim(0)?;
-    let vs = probs.dim(1)?;
-    let mut result = Vec::with_capacity(b);
-    for i in 0..b {
-        let row = probs.narrow(0, i, 1)?.squeeze(0)?.to_vec1::<f32>()?;
-        let r: f32 = fastrand::f32();
-        let mut cum = 0.0f32;
-        let mut chosen = (vs - 1) as i64;
-        for (j, &v) in row.iter().enumerate() {
-            cum += v;
-            if r < cum { chosen = j as i64; break; }
-        }
-        result.push(chosen);
-    }
-    Tensor::from_vec(result, (b, 1), dev)
 }
