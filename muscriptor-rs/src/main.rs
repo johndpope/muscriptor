@@ -72,6 +72,12 @@ struct Cli {
     #[arg(long)]
     cpu: bool,
 
+    /// Transformer compute dtype: f32, f16 or bf16. Defaults to f16 on Metal
+    /// (decoding is bandwidth-bound there), f32 elsewhere. Conditioners always
+    /// run in f32.
+    #[arg(long)]
+    dtype: Option<String>,
+
     /// Maximum generated tokens per chunk.
     #[arg(long, default_value = "2000")]
     max_gen_len: usize,
@@ -165,8 +171,20 @@ fn load_model(cli: &Cli, device: &Device) -> Result<Model, Box<dyn std::error::E
     };
     log::info!("Weights: {}", weights_path.display());
 
+    // Transformer dtype: explicit --dtype, else f16 on Metal (bandwidth-bound
+    // decoding) and f32 everywhere else. Conditioners always run in f32.
+    let dtype = match cli.dtype.as_deref() {
+        Some("f32") | Some("float32") => DType::F32,
+        Some("f16") | Some("float16") => DType::F16,
+        Some("bf16") | Some("bfloat16") => DType::BF16,
+        Some(other) => return Err(format!("unsupported dtype '{other}' (use f32, f16 or bf16)").into()),
+        None if device.is_metal() => DType::F16,
+        None => DType::F32,
+    };
+    log::info!("Transformer dtype: {:?}", dtype);
+
     let t0 = Instant::now();
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights_path], DType::F32, device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights_path], dtype, device)? };
     let vb_f32 = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights_path], DType::F32, device)? };
     let model = Model::new(&config, vb, vb_f32)?;
     log::info!("Model loaded in {:.2}s", t0.elapsed().as_secs_f64());
