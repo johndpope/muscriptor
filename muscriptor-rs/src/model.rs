@@ -257,12 +257,16 @@ impl TF {
     }
 
     fn forward(&self, x: &Tensor, offs: &[usize], kcs: &mut [Option<Tensor>], vcs: &mut [Option<Tensor>], los: &mut [usize]) -> Result<Tensor> {
-        let (b, t, d) = x.dims3()?;
+        let (_b, t, d) = x.dims3()?;
         let dev = x.device();
         let dt = x.dtype();
-        let pos: Vec<f32> = (0..t).flat_map(|ti| offs.iter().map(move |&o| (o + ti) as f32)).collect();
-        let pt = Tensor::from_vec(pos, (b, t, 1), dev)?.to_dtype(dt)?;
-        let mut h = (x + sin_embedding(&pt, d, self.max_period)?)?;
+        // Positions are the same for every batch row, so build [1, t, 1] and let
+        // the add broadcast over the batch. (`offs` carries the current cache
+        // offset in offs[0].)
+        let base = offs.first().copied().unwrap_or(0);
+        let pos: Vec<f32> = (0..t).map(|ti| (base + ti) as f32).collect();
+        let pt = Tensor::from_vec(pos, (1, t, 1), dev)?.to_dtype(dt)?;
+        let mut h = x.broadcast_add(&sin_embedding(&pt, d, self.max_period)?)?;
         for (i, l) in self.layers.iter().enumerate() {
             h = l.forward(&h, &mut kcs[i], &mut vcs[i], &mut los[i])?;
         }
@@ -426,6 +430,57 @@ impl LMModel {
         } else {
             logits.argmax(1)?.squeeze(0)?.to_dtype(DType::I64)?.to_scalar::<i64>()
         }
+    }
+
+    /// Pick the next token for each row of a `[b, card]` logits tensor.
+    fn pick_batch(&self, logits: &Tensor, sample: bool, temp: f64, dev: &Device) -> Result<Vec<i64>> {
+        if sample && temp > 0.0 {
+            let temp_t = Tensor::new(temp as f32, dev)?;
+            let probs = candle_nn::ops::softmax(&(logits / temp_t)?, 1)?;
+            sample_token(&probs, dev)?.flatten_all()?.to_vec1::<i64>()
+        } else {
+            logits.argmax(1)?.to_dtype(DType::I64)?.to_vec1::<i64>()
+        }
+    }
+
+    /// Generate tokens for a batch of `b` chunks at once (no prelude forcing).
+    /// The batch is stepped together until every row emits EOS or `max_len` is
+    /// reached; each returned sequence is truncated at its EOS.
+    pub fn generate_batch(
+        &self, mel: &Tensor, inst: &Tensor, ds: &Tensor,
+        max_len: usize, sample: bool, temp: f64,
+    ) -> Result<Vec<Vec<i64>>> {
+        let dev = mel.device();
+        let eos = 1i64;
+        let init = self.card as i64;
+        let b = mel.dim(0)?;
+        let nl = self.tf.layers.len();
+        let mut kcs: Vec<Option<Tensor>> = vec![None; nl];
+        let mut vcs: Vec<Option<Tensor>> = vec![None; nl];
+        let mut los: Vec<usize> = vec![0; nl];
+
+        let mut rows: Vec<Vec<i64>> = vec![Vec::new(); b];
+        let mut done = vec![false; b];
+
+        // Prefill one BOS per row; conditioning is prepended inside forward.
+        let seq = Tensor::from_vec(vec![init; b], (b, 1), dev)?;
+        let out = self.forward(&seq, mel, inst, ds, true, &mut kcs, &mut vcs, &mut los)?;
+        let s = out.dim(1)?;
+        let mut logits = out.narrow(1, s - 1, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
+
+        for _ in 0..max_len {
+            let toks = self.pick_batch(&logits, sample, temp, dev)?;
+            for (i, &t) in toks.iter().enumerate() {
+                if !done[i] {
+                    if t == eos { done[i] = true; } else { rows[i].push(t); }
+                }
+            }
+            if done.iter().all(|&d| d) { break; }
+            let next = Tensor::from_vec(toks, (b, 1), dev)?;
+            let out = self.forward(&next, mel, inst, ds, false, &mut kcs, &mut vcs, &mut los)?;
+            logits = out.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
+        }
+        Ok(rows)
     }
 
     /// Autoregressively generate tokens for one chunk.
