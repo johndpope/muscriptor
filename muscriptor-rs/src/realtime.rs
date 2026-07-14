@@ -16,6 +16,9 @@ use crate::tokenizer::{self, Note};
 
 const CHUNK_DURATION_SECS: f64 = 4.0;
 const OVERLAP_SECS: f64 = 1.0;
+/// Skip chunks whose peak is below this (silence / noise floor) so we don't
+/// amplify a near-silent window into garbage.
+const SILENCE_PEAK: f32 = 0.005;
 
 pub struct RealtimeTranscriber {
     model: Model,
@@ -38,9 +41,19 @@ impl RealtimeTranscriber {
         if chunk_audio.is_empty() {
             return Ok(vec![]);
         }
+        // Mic input is often very quiet (a webcam mic can peak at only a few
+        // percent of full-scale), and the model expects healthy levels. Skip
+        // near-silence, then peak-normalize the chunk to ~0.9 so the mel
+        // front-end sees the same range as a normal recording.
+        let peak = chunk_audio.iter().fold(0f32, |m, &s| m.max(s.abs()));
+        if peak < SILENCE_PEAK {
+            return Ok(vec![]);
+        }
+        let gain = 0.9 / peak;
+
         // The model works on fixed 5-second segments; zero-pad the mic window.
         let segment_samples = (SEGMENT_DURATION * SAMPLE_RATE as f64) as usize;
-        let mut segment = chunk_audio.to_vec();
+        let mut segment: Vec<f32> = chunk_audio.iter().map(|&s| s * gain).collect();
         segment.resize(segment_samples, 0.0);
 
         let prefix = self.model.build_prefix(&[segment], self.inst_ids.as_deref())?;
@@ -134,6 +147,24 @@ pub fn list_devices() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Downmix interleaved f32 samples to mono and append to the ring buffer,
+/// evicting the oldest samples past `capacity`.
+fn push_mono(ring: &Mutex<VecDeque<f32>>, data: &[f32], channels: usize, capacity: usize) {
+    let mut buf = ring.lock().unwrap();
+    if channels > 1 {
+        for ch in data.chunks(channels) {
+            let mono: f32 = ch.iter().sum::<f32>() / channels as f32;
+            if buf.len() >= capacity { buf.pop_front(); }
+            buf.push_back(mono);
+        }
+    } else {
+        for &s in data {
+            if buf.len() >= capacity { buf.pop_front(); }
+            buf.push_back(s);
+        }
+    }
+}
+
 /// Start microphone capture. Returns a receiver yielding (audio_chunk, start_time).
 /// `device_match` selects an input device by case-insensitive name substring
 /// (None = the system default).
@@ -158,42 +189,55 @@ pub fn start_mic_capture(
     if let Ok(name) = input_device.name() {
         log::info!("Input device: {name}");
     }
-    let config = input_device.default_input_config()?;
-    let channels = config.channels() as usize;
-    let device_sr = config.sample_rate().0;
+    let supported = input_device.default_input_config()?;
+    let sample_format = supported.sample_format();
+    let channels = supported.channels() as usize;
+    let device_sr = supported.sample_rate().0;
+    let config: cpal::StreamConfig = supported.into();
+    log::info!("Input format: {:?}, {} ch, {} Hz", sample_format, channels, device_sr);
 
-    // The ring buffer holds mono samples at the device's native rate; chunks
+    // The ring buffer holds mono f32 samples at the device's native rate; chunks
     // are resampled to 16 kHz before being sent to the model.
     let capacity = device_sr as usize * 30;
     let ring: Arc<Mutex<VecDeque<f32>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(capacity)));
-    let ring_clone = ring.clone();
     let err_fn = |err| eprintln!("Audio stream error: {err}");
 
-    let stream = input_device.build_input_stream(
-        &config.into(),
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let mut buf = ring_clone.lock().unwrap();
-            if channels > 1 {
-                for ch in data.chunks(channels) {
-                    let mono: f32 = ch.iter().sum::<f32>() / channels as f32;
-                    if buf.len() >= capacity {
-                        buf.pop_front();
-                    }
-                    buf.push_back(mono);
-                }
-            } else {
-                for &s in data {
-                    if buf.len() >= capacity {
-                        buf.pop_front();
-                    }
-                    buf.push_back(s);
-                }
-            }
-        },
-        err_fn,
-        None,
-    )?;
+    // Build the stream in the device's *native* sample format (many mics —
+    // e.g. USB webcams — only offer i16, not f32) and convert to f32 here.
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            let ring = ring.clone();
+            input_device.build_input_stream(
+                &config,
+                move |data: &[f32], _: &_| push_mono(&ring, data, channels, capacity),
+                err_fn, None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let ring = ring.clone();
+            input_device.build_input_stream(
+                &config,
+                move |data: &[i16], _: &_| {
+                    let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                    push_mono(&ring, &f, channels, capacity);
+                },
+                err_fn, None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let ring = ring.clone();
+            input_device.build_input_stream(
+                &config,
+                move |data: &[u16], _: &_| {
+                    let f: Vec<f32> = data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
+                    push_mono(&ring, &f, channels, capacity);
+                },
+                err_fn, None,
+            )?
+        }
+        other => return Err(format!("unsupported input sample format: {other:?}").into()),
+    };
 
     let (tx, rx): (Sender<(Vec<f32>, f64)>, _) = bounded(10);
     let chunk_samples = (CHUNK_DURATION_SECS * device_sr as f64) as usize;
