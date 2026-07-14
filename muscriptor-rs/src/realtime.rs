@@ -79,17 +79,37 @@ pub fn run_realtime(
     model: Model,
     inst_ids: Option<Vec<u32>>,
     opts: GenerateOptions,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut transcriber = RealtimeTranscriber::new(model, inst_ids, opts);
 
     log::info!("Starting realtime mic capture...");
     let (_stream, rx) = start_mic_capture()?;
-    println!("🎤 Listening... play music! (start_time\\tpitch\\tduration\\tprogram)");
+    // Status/banner goes to stderr so stdout stays a clean machine-readable
+    // stream (TSV, or JSONL for a UI).
+    eprintln!("🎤 Listening... play music!");
+    if !json {
+        eprintln!("(stdout columns: start_time\tpitch\tduration\tprogram)");
+    }
     for (chunk_audio, start_time) in rx {
         match transcriber.transcribe_chunk(&chunk_audio, start_time) {
             Ok(notes) => {
                 for n in &notes {
-                    println!("{:.3}\t{}\t{:.3}\t{}", n.onset, n.pitch, n.offset - n.onset, n.program);
+                    if json {
+                        // One JSON object per line (JSONL) — instrument is a
+                        // fixed-vocabulary identifier, so no escaping needed.
+                        println!(
+                            "{{\"start_time\":{:.3},\"duration\":{:.3},\"pitch\":{},\"program\":{},\"instrument\":\"{}\",\"is_drum\":{}}}",
+                            n.onset,
+                            n.offset - n.onset,
+                            n.pitch,
+                            n.program,
+                            tokenizer::instrument_for_program(n.program),
+                            n.is_drum,
+                        );
+                    } else {
+                        println!("{:.3}\t{}\t{:.3}\t{}", n.onset, n.pitch, n.offset - n.onset, n.program);
+                    }
                 }
                 std::io::stdout().flush().ok();
             }

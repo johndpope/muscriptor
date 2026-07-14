@@ -89,6 +89,11 @@ struct Cli {
     /// Print decoded note events to stderr.
     #[arg(long)]
     notes: bool,
+
+    /// With --mic, emit one JSON object per note (JSONL) instead of TSV, for a
+    /// UI to consume.
+    #[arg(long)]
+    json: bool,
 }
 
 fn load_device(cpu: bool) -> Device {
@@ -345,7 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let inst_ids = instrument_ids(&cli)?;
             let opts = build_options(&cli);
-            realtime::run_realtime(model, inst_ids, opts)?;
+            realtime::run_realtime(model, inst_ids, opts, cli.json)?;
         }
         #[cfg(not(feature = "realtime"))]
         {
